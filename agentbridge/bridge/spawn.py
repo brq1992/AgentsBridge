@@ -1,8 +1,10 @@
 """Start the Agent so its lifetime does not depend on the calling app.
 
 An Agent started from an AI tool's shell (Claude, Codex) inherits that app's Windows job
-object and is killed when the app exits. Windows can only break away when the job allows it,
-so this module tries breakaway first and reports honestly when it was refused.
+object; if the job is configured to kill its processes on close, the Agent stops with the app.
+Job membership alone does not prove that. Windows only allows breakaway when the job permits
+it, so this module tries breakaway and, if refused, does not start unless the caller
+explicitly accepts a dependent lifetime (allow_attached).
 """
 import json
 import os
@@ -54,8 +56,15 @@ def agent_command(install, state, hub_config):
             '--state', str(state), 'agent', '--hub-config', str(hub_config)]
 
 
-def spawn_detached(args, cwd, stdout, stderr, popen=subprocess.Popen):
-    """Returns (process, breakaway). breakaway False means the child shares the caller's job."""
+INDEPENDENT_HINT = ('Windows refused to start the Agent outside the calling program\'s job (error 5), so it '
+                    'would stop when that program exits. Start it from File Explorer (independent-launcher '
+                    'Start-Agent.cmd) or a Start-menu PowerShell, or pass --allow-attached / -AllowAttached '
+                    'to accept a dependent lifetime.')
+
+
+def spawn_detached(args, cwd, stdout, stderr, popen=subprocess.Popen, allow_attached=False):
+    """Returns (process, breakaway). breakaway False means the child shares the caller's job,
+    which only happens with allow_attached; otherwise a refused breakaway raises."""
     common = dict(cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, close_fds=True)
     if os.name != 'nt':
         return popen(args, start_new_session=True, **common), None
@@ -66,12 +75,30 @@ def spawn_detached(args, cwd, stdout, stderr, popen=subprocess.Popen):
         except OSError as e:
             if getattr(e, 'winerror', None) != 5:
                 raise
-            # The caller's job forbids breakaway: start anyway, but never claim independence.
+            if not allow_attached:
+                raise BridgeError(INDEPENDENT_HINT) from None
             return popen(args, creationflags=base, **common), False
     return popen(args, creationflags=base, **common), True
 
 
-def agent_start(state, hub_config=None, install=None, health=None, popen=subprocess.Popen, timeout=20):
+def breakaway_possible(popen=subprocess.Popen):
+    """Probe with a no-op child; nothing else is started."""
+    if os.name != 'nt' or not in_job():
+        return True
+    exe, _ = interpreter()
+    try:
+        child = popen([exe, '-c', 'pass'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL, creationflags=subprocess.DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB)
+    except OSError as e:
+        if getattr(e, 'winerror', None) == 5:
+            return False
+        raise
+    child.wait(timeout=20)
+    return True
+
+
+def agent_start(state, hub_config=None, install=None, health=None, popen=subprocess.Popen, timeout=20,
+                allow_attached=False):
     """Start the Agent unless one is already healthy for this state directory."""
     from .cli import call
     state = Path(state).resolve()
@@ -98,7 +125,8 @@ def agent_start(state, hub_config=None, install=None, health=None, popen=subproc
             raise BridgeError('another Agent owns the state lock but does not answer; inspect its logs')
         held.close()
     with (state / 'Agent.stdout.log').open('ab') as out, (state / 'Agent.stderr.log').open('ab') as err:
-        process, breakaway = spawn_detached(agent_command(install, state, hub_config), install, out, err, popen)
+        process, breakaway = spawn_detached(agent_command(install, state, hub_config), install, out, err, popen,
+                                            allow_attached)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status = probe()
@@ -106,8 +134,8 @@ def agent_start(state, hub_config=None, install=None, health=None, popen=subproc
             result = {'action': 'started', 'pid': status['pid'], 'hub_connected': status.get('hub_connected'),
                       'windows_job_member': status.get('windows_job_member'), 'breakaway': breakaway}
             if breakaway is False:
-                result['warning'] = ('Windows refused breakaway from the calling app; this Agent stops when that '
-                                     'app exits. Restart it from File Explorer or a Start-menu PowerShell.')
+                result['warning'] = ('Started with --allow-attached: this Agent shares the calling program\'s '
+                                     'job and may stop when that program exits.')
             return result
         if process.poll() is not None:
             raise BridgeError('Agent exited during startup; see Agent.stderr.log')

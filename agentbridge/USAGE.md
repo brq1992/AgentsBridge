@@ -1,4 +1,4 @@
-# AgentBridge M1 使用说明（R4）
+# AgentBridge M1 使用说明（R5）
 
 AgentBridge 让多台 Windows 机器上**已经打开的原会话**（Claude Code、Codex）互相发消息。
 默认政策只授权 echo 测试：收到 `{"op":"echo","text":"…"}` 的请求，原样回复；其他内容只 ack、记为 blocked，
@@ -24,7 +24,7 @@ AgentBridge 让多台 Windows 机器上**已经打开的原会话**（Claude Cod
 1. **启动 Agent**：在文件资源管理器里双击 independent-launcher 的 `Start-Agent.cmd`（先按其 README 配好 `profile.json`）。
    - 返回 `started` 或 `already_running` 都正常，记下 PID。
    - **不要**让 Claude / Codex 用工具去启动 Agent：从 AI 工具 shell 起的 Agent 会随该应用退出而被杀
-     （`agent-start` 会在这种情况下给出 warning）。
+     （`agent-start` 在这种情况下默认拒绝启动）。
 2. **看状态**：双击 `Status-Agent.cmd`，或在开始菜单打开的 PowerShell 里：
    ```powershell
    & "$bridgeRoot\runtime\python.exe" "$bridgeRoot\agentbridge.py" --state "$bridgeState" doctor
@@ -37,8 +37,9 @@ AgentBridge 让多台 Windows 机器上**已经打开的原会话**（Claude Cod
    - `should_execute=true` 且是 echo → 用 reply 命令原样回复一次（`--final`）；
    - 是 reply → 只 ack，不再回复；
    - 其他（notice 等）→ ack 后 `--outcome blocked` 记录，交给本机用户决定。
-   - ack 返回 `claim_unconfirmed_do_not_execute`：先不要执行，稍后**再运行同一条 ack**；
-     若 Hub 已认领，会把那次认领返回给你（只返回一次）。
+   - ack 返回 `should_execute=false` 且 reason 为 `claim_unconfirmed_do_not_execute`、`ack_response_lost_…` 或
+     `claim_receipt_unconfirmed_…`：先不要执行，稍后**再运行同一条 ack**。许可只在 CLI 回执成功后才会显示为
+     true，丢失的响应不会消耗许可，也不会让两个调用方都执行。
 
 多台机器不要同时关 Agent；需要重启时一台做完、doctor 正常后再做下一台。
 
@@ -51,7 +52,10 @@ AgentBridge 让多台 Windows 机器上**已经打开的原会话**（Claude Cod
 .\upgrade-recovery.ps1 -InstallDirectory "$bridgeRoot" -State "$bridgeState"
 ```
 
-- 只升级本机 Agent；绑定、权限、状态、客户端令牌不变。失败会自动还原并重启旧 Agent。
+- 只升级本机 Agent；绑定、权限、状态、客户端令牌不变。失败会自动还原、按哈希核对，并确认旧 Agent 以新进程
+  重新运行；做不到时会明确报告 ROLLBACK IS INCOMPLETE。
+- 必须在开始菜单打开的 PowerShell 里运行：在 AI 工具的 shell 里 Windows 通常禁止 Agent 脱离，脚本会在停止
+  任何东西之前拒绝。确实要接受依附启动时才加 `-AllowAttached`。
 - 逐台升级：一台 doctor 正常后再升级下一台，最后做双向 echo 验证。
 - Hub：`agentbridge.py --state "$hubState" hub-stop`，把 Hub 安装目录的整个 `bridge\` 换成新版本，再
   `start-m1.ps1 -Mode Hub -State "$hubState" -Python …`。Hub 停止期间消息暂停，Agent 会自动重连。

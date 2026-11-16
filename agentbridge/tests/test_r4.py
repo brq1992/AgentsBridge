@@ -20,7 +20,8 @@ from bridge.spawn import spawn_detached
 from bridge.store import BridgeError, Store, uid
 
 
-class AbandonedClaimTests(unittest.TestCase):
+class ClaimFixture:
+    """Agent + store with one bound Claude session and one delivery job (no tests)."""
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
@@ -50,6 +51,8 @@ class AbandonedClaimTests(unittest.TestCase):
     def ack(self):
         return self.agent.forward('/ack', {'actor': self.session['id'], 'message_id': 'm_abandoned'})
 
+
+class AbandonedClaimTests(ClaimFixture, unittest.TestCase):
     def test_claim_reached_hub_after_caller_gave_up_is_returned_once(self):
         claim = {'should_execute': True, 'kind': 'request', 'body': 'x', 'message_id': 'm_abandoned'}
         rid = self.insert_ack('done', claim)
@@ -72,16 +75,19 @@ class AbandonedClaimTests(unittest.TestCase):
         with self.store.connect() as c:
             self.assertEqual(c.execute("SELECT count(*) FROM net_ops WHERE op='ack'").fetchone()[0], 1)
 
-    def test_prune_keeps_unreturned_claims(self):
-        old = time.time() - 8 * 86400
-        kept = self.insert_ack('done', {'should_execute': True}, created=old)
+    def test_prune_bounds_unreceived_claims(self):
+        # An unreceived claim stays retrievable while its message could still be valid
+        # (TTL <= 24 h) and is dropped after 2 days; other finished rows after 7 days.
+        now = time.time()
+        recent = self.insert_ack('done', {'should_execute': True}, created=now - 86400)
+        self.insert_ack('done', {'should_execute': True}, created=now - 3 * 86400)
         with self.store.connect() as c:
-            c.execute("INSERT INTO net_ops(id,op,args,state,created) VALUES('rpc_old','report','{}','done',?)", (old,))
-            c.execute("INSERT INTO net_ops(id,op,args,state,created) VALUES('rpc_new','report','{}','done',?)", (time.time(),))
-        self.assertEqual(self.agent.prune(), 1)
+            c.execute("INSERT INTO net_ops(id,op,args,state,created) VALUES('rpc_old','report','{}','done',?)", (now - 8 * 86400,))
+            c.execute("INSERT INTO net_ops(id,op,args,state,created) VALUES('rpc_new','report','{}','done',?)", (now,))
+        self.assertEqual(self.agent.prune(), 2)
         with self.store.connect() as c:
             ids = {r[0] for r in c.execute('SELECT id FROM net_ops')}
-        self.assertEqual(ids, {kept, 'rpc_new'})
+        self.assertEqual(ids, {recent, 'rpc_new'})
 
 
 class ClaudeEndpointTests(unittest.TestCase):
@@ -176,7 +182,7 @@ class ClientDirectoryTests(unittest.TestCase):
 
 class SpawnTests(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'Windows job objects')
-    def test_refused_breakaway_starts_but_reports_dependence(self):
+    def test_refused_breakaway_refuses_unless_dependence_accepted(self):
         calls = []
         def popen(args, creationflags=0, **kw):
             calls.append(creationflags)
@@ -184,8 +190,11 @@ class SpawnTests(unittest.TestCase):
                 raise OSError(13, 'denied', None, 5)
             return 'process'
         with patch('bridge.spawn.in_job', return_value=True):
-            self.assertEqual(spawn_detached(['x'], '.', None, None, popen), ('process', False))
-        self.assertEqual(len(calls), 2)
+            with self.assertRaises(BridgeError):
+                spawn_detached(['x'], '.', None, None, popen)
+            self.assertEqual(len(calls), 1, 'nothing may be started after a refused breakaway')
+            self.assertEqual(spawn_detached(['x'], '.', None, None, popen, allow_attached=True), ('process', False))
+        self.assertEqual(len(calls), 3)
         with patch('bridge.spawn.in_job', return_value=False):
             self.assertEqual(spawn_detached(['x'], '.', None, None, popen), ('process', True))
 

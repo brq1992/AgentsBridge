@@ -35,6 +35,12 @@ class UpgradeTests(unittest.TestCase):
             lines=old.splitlines(keepends=True)
             del lines[method.lineno-1:method.end_lineno]
             store_file.write_text(''.join(lines))
+            # A real older install also has an older CLI (no agent-start); the updater must
+            # not rely on new commands through the installed runtime.
+            cli_file=install/'bridge/cli.py'
+            cli_text=cli_file.read_text()
+            self.assertIn("sub.add_parser('agent-start'",cli_text)
+            cli_file.write_text(cli_text.replace("sub.add_parser('agent-start'","sub.add_parser('agent-start-absent-in-legacy'"))
             state=root/'state'
             state.mkdir()
             create_tls(root,['127.0.0.1'])
@@ -67,7 +73,7 @@ class UpgradeTests(unittest.TestCase):
                         self.fail('isolated legacy Agent failed to start')
                     time.sleep(.1)
                 command=['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-File',str(source/'upgrade-recovery.ps1'),
-                         '-InstallDirectory',str(install),'-State',str(state)]
+                         '-InstallDirectory',str(install),'-State',str(state),'-AllowAttached']
                 def run_updater(arguments,label):
                     # Start-Process can pass pipe handles to the background Agent;
                     # use files so communicate() does not await the long-lived child.

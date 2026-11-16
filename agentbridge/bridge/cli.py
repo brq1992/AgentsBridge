@@ -10,7 +10,13 @@ import urllib.request
 from .store import BridgeError
 
 
-def call(state, route, body):
+# The Agent answers an ack within RemoteAgent.ACK_WAIT (20 s); the client waits longer so a
+# slow Hub yields an explicit 'unconfirmed' answer instead of a lost local response.
+ACK_TIMEOUT = 45
+DEFAULT_TIMEOUT = 15
+
+
+def call(state, route, body, timeout=DEFAULT_TIMEOUT):
     config = json.loads((Path(state) / 'client.json').read_text(encoding='utf8'))
     if not config['url'].startswith('http://127.0.0.1:'):
         raise BridgeError('M0 only connects to a loopback coordinator')
@@ -19,7 +25,7 @@ def call(state, route, body):
                                  {'Authorization': 'Bearer ' + config['token'], 'Content-Type': 'application/json'})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(req, timeout=15) as response:
+        with opener.open(req, timeout=timeout) as response:
             data = json.load(response)
     except urllib.error.HTTPError as e:
         with e:
@@ -30,6 +36,34 @@ def call(state, route, body):
     if not data['ok']:
         raise BridgeError(data['error'])
     return data['result']
+
+
+def claim(state, body, ack_timeout=ACK_TIMEOUT, receipt_attempts=3):
+    """ack with an explicit receipt. Execution permission is reported only after the
+    Agent has recorded that THIS caller received it; any loss before that leaves the
+    claim available to the next ack, and nothing after the receipt is lost silently."""
+    import secrets
+    nonce = secrets.token_hex(16)
+    try:
+        result = call(state, '/ack', dict(body, claim_nonce=nonce), timeout=ack_timeout)
+    except (OSError, TimeoutError) as e:
+        return {'should_execute': False, 'reason': 'ack_response_lost_' + type(e).__name__,
+                'retry': 'run the same ack again; the claim was not consumed'}
+    receipt = result.pop('claim_receipt', None)
+    if not receipt or not result.get('should_execute'):
+        return result
+    last = None
+    for _ in range(receipt_attempts):
+        try:
+            call(state, '/ack-receipt', {'actor': body['actor'], 'operation_id': receipt, 'claim_nonce': nonce})
+            return result
+        except BridgeError as e:
+            # A definite refusal (another caller received it, binding changed, expired).
+            return {'should_execute': False, 'reason': 'claim_receipt_rejected', 'detail': str(e)[:200]}
+        except (OSError, TimeoutError) as e:
+            last = e
+    return {'should_execute': False, 'reason': 'claim_receipt_unconfirmed_' + type(last).__name__,
+            'retry': 'run the same ack again; if the receipt was recorded the claim is reported as already received'}
 
 
 def main():
@@ -44,6 +78,10 @@ def main():
     agent.add_argument('--hub-config')
     agent_start = sub.add_parser('agent-start', help='Start the M1 Agent detached unless it already runs')
     agent_start.add_argument('--hub-config')
+    agent_start.add_argument('--allow-attached', action='store_true',
+                             help='Start even if Windows refuses breakaway (Agent may stop with the caller)')
+    agent_start.add_argument('--check-breakaway', action='store_true',
+                             help='Only report whether an independent start is possible here; starts nothing')
     for name in ('doctor', 'discover', 'list', 'stop'):
         sub.add_parser(name)
     init = sub.add_parser('hub-init')
@@ -116,8 +154,12 @@ def main():
             run(args.state, args.hub_config)
             return
         if args.command == 'agent-start':
-            from .spawn import agent_start
-            print(json.dumps({'ok': True, 'result': agent_start(args.state, args.hub_config)}, ensure_ascii=False))
+            from .spawn import agent_start, breakaway_possible
+            if args.check_breakaway:
+                result = {'independent_start_possible': breakaway_possible()}
+            else:
+                result = agent_start(args.state, args.hub_config, allow_attached=args.allow_attached)
+            print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))
             return
         tool = args.tool or ('codex' if os.environ.get('CODEX_THREAD_ID') else None)
         native = args.session or (os.environ.get('CODEX_THREAD_ID') if tool == 'codex' else None)
@@ -150,7 +192,10 @@ def main():
             body['message_id'] = args.message
         if args.command == 'reply':
             body['outcome'] = args.outcome
-        result = call(args.state, routes[args.command], body)
+        if args.command == 'ack':
+            result = claim(args.state, body)
+        else:
+            result = call(args.state, routes[args.command], body)
         print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))
     except (BridgeError, OSError, ValueError) as e:
         print(json.dumps({'ok': False, 'error': str(e)}, ensure_ascii=False))

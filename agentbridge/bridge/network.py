@@ -60,8 +60,11 @@ class RemoteAgent:
             # handed=1 once an operation result has been returned to its caller. An ack
             # whose caller gave up before the Hub answered keeps handed=0, so the next
             # ack for the same message and actor receives that stored claim exactly once.
-            if 'handed' not in {r['name'] for r in c.execute('PRAGMA table_info(net_ops)')}:
+            columns={r['name'] for r in c.execute('PRAGMA table_info(net_ops)')}
+            if 'handed' not in columns:
                 c.execute('ALTER TABLE net_ops ADD COLUMN handed INTEGER NOT NULL DEFAULT 0')
+            if 'claim_nonce' not in columns:
+                c.execute('ALTER TABLE net_ops ADD COLUMN claim_nonce TEXT')
             for r in c.execute("SELECT * FROM net_jobs WHERE state='submitting'").fetchall():
                 self._phase(c,r['id'],'delivery_uncertain',{'reason':'Agent restarted during native submission'})
         self._pruned_at=0.0
@@ -108,17 +111,86 @@ class RemoteAgent:
                     health[session['id']]['hint']=e.hint
         self.endpoint_health=health
 
+    # Longest a local ack request waits; must stay well below cli.ACK_TIMEOUT.
+    ACK_WAIT=20
+
+    def _claim_still_valid(self,c,args):
+        """Execution permission is only handed out under the generation that claimed it,
+        while the message has not expired."""
+        local_id=args['actor'].removeprefix(self.node_id+':')
+        current=c.execute('SELECT generation,enabled FROM sessions WHERE id=?',(local_id,)).fetchone()
+        if not current or not current['enabled'] or current['generation']!=args.get('generation'):
+            return 'binding_changed'
+        job=c.execute('SELECT envelope FROM net_jobs WHERE id=?',(args['message_id'],)).fetchone()
+        if job:
+            expires=json.loads(job['envelope']).get('expires')
+            if expires is not None and expires<=time.time():
+                return 'expired'
+        return None
+
+    def _hand_out(self,c,rid,args,result,nonce):
+        """Atomically give a finished ack result to exactly one caller.
+
+        Without a nonce the result is consumed now (single winner via handed=0 guard).
+        With a nonce (the CLI) an execution permission is only offered: it is consumed by
+        a successful /ack-receipt, so a lost response leaves it available to the next ack.
+        """
+        if not result.get('should_execute'):
+            c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(rid,))
+            if result.get('kind')=='reply':
+                c.execute("UPDATE net_jobs SET state='received' WHERE id=?",(args['message_id'],))
+            return result
+        invalid=self._claim_still_valid(c,args)
+        if invalid:
+            c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(rid,))
+            return {'should_execute':False,'reason':invalid,'operation_id':rid}
+        if nonce:
+            if not c.execute('UPDATE net_ops SET claim_nonce=? WHERE id=? AND handed=0',(nonce,rid)).rowcount:
+                return {'should_execute':False,'reason':'claim_already_received','operation_id':rid}
+            return dict(result,claim_receipt=rid)
+        if not c.execute('UPDATE net_ops SET handed=1 WHERE id=? AND handed=0',(rid,)).rowcount:
+            return {'should_execute':False,'reason':'claim_already_received','operation_id':rid}
+        c.execute("UPDATE net_jobs SET state='received' WHERE id=?",(args['message_id'],))
+        return result
+
+    def receipt(self,b):
+        """Consume an offered claim for the caller holding its nonce (idempotent for it)."""
+        rid,nonce=b.get('operation_id'),b.get('claim_nonce')
+        with self.store.connect() as c:
+            actor=self.store._session(c,b['actor'])
+            row=c.execute("SELECT * FROM net_ops WHERE id=? AND op='ack' AND state='done'",(rid,)).fetchone()
+            if not row or not nonce or row['claim_nonce']!=nonce:
+                raise BridgeError('claim receipt rejected: not offered to this caller')
+            args=json.loads(row['args'])
+            if args['actor']!=self.node_id+':'+actor['id']:
+                raise BridgeError('claim receipt rejected: different session')
+            if row['handed']:
+                return {'receipt':True,'operation_id':rid}
+            invalid=self._claim_still_valid(c,args)
+            if invalid:
+                c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(rid,))
+                raise BridgeError('claim receipt rejected: '+invalid)
+            c.execute('UPDATE net_ops SET handed=1 WHERE id=? AND handed=0 AND claim_nonce=?',(rid,nonce))
+            c.execute("UPDATE net_jobs SET state='received' WHERE id=?",(args['message_id'],))
+            return {'receipt':True,'operation_id':rid}
+
     OUTBOX_RETENTION=7*86400
 
     def prune(self,now=None):
         """Drop finished outbox rows well past every message TTL (max 24 h).
 
-        Unreturned ack results (handed=0) are kept so a late caller can still get them.
+        Unreceived ack results (handed=0) are kept only while they could still be valid:
+        their message expires within 24 h, so after 2 days they are dropped too (they would
+        be refused as expired anyway). Delivery jobs past expiry are dropped likewise.
         """
-        cutoff=(now or time.time())-self.OUTBOX_RETENTION
+        now=now or time.time()
+        cutoff=now-self.OUTBOX_RETENTION
         with self.store.connect() as c:
-            removed=c.execute("""DELETE FROM net_ops WHERE state IN ('done','failed') AND created<?
-                AND (op!='ack' OR handed=1)""",(cutoff,)).rowcount
+            removed=c.execute("""DELETE FROM net_ops WHERE state IN ('done','failed') AND (
+                (created<? AND (op!='ack' OR handed=1)) OR (op='ack' AND handed=0 AND created<?))""",
+                (cutoff,now-2*86400)).rowcount
+            removed+=c.execute("""DELETE FROM net_jobs WHERE state NOT IN ('submitting','retry_pending')
+                AND json_extract(envelope,'$.expires')<?""",(cutoff,)).rowcount
         return removed
 
     def _enqueue(self,c,op,args,deadline=None):
@@ -186,13 +258,18 @@ class RemoteAgent:
                 if local:
                     args['to']=self.label+'/'+args['to']
             rid=None
+            nonce=b.get('claim_nonce') if op=='ack' else None
+            if nonce is not None and (not isinstance(nonce,str) or not 8<=len(nonce)<=64 or not nonce.isalnum()):
+                raise BridgeError('invalid claim nonce')
             if op=='ack':
-                # Reuse an unfinished or unreturned claim instead of asking the Hub again:
-                # a second Hub ack would answer already_received and the request would
-                # never run (claimed at the Hub but abandoned by the timed-out caller).
+                # Reuse an unfinished or unreceipted claim of the SAME binding generation
+                # instead of asking the Hub again: a second Hub ack would answer
+                # already_received and the request would never run. A claim made under an
+                # older generation is never reused (rebind/revocation invalidates it).
                 previous=c.execute("""SELECT id,state FROM net_ops WHERE op='ack' AND handed=0
                     AND json_extract(args,'$.message_id')=? AND json_extract(args,'$.actor')=?
-                    ORDER BY seq DESC LIMIT 1""",(args['message_id'],args['actor'])).fetchone()
+                    AND json_extract(args,'$.generation')=?
+                    ORDER BY seq DESC LIMIT 1""",(args['message_id'],args['actor'],args['generation'])).fetchone()
                 if previous and previous['state']=='failed':
                     c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(previous['id'],))
                 elif previous:
@@ -201,17 +278,18 @@ class RemoteAgent:
                 rid=self._enqueue(c,op,args,time.time()+10 if op in ('ack','status') else None)
         self.wake.set()
         deadline=time.monotonic()+(12 if op in ('ack','status') else 2)
-        # Once transmitted ('sending'), the Hub may already have committed the claim;
-        # keep waiting for its answer rather than reporting failure early.
-        hard_deadline=deadline+12
+        # Once transmitted ('sending'), the Hub may already have committed the claim; keep
+        # waiting for its answer, but always return well before the CLI timeout
+        # (cli.ACK_TIMEOUT) so a slow Hub never turns into a lost local response.
+        hard_deadline=time.monotonic()+(self.ACK_WAIT if op=='ack' else 24)
         while time.monotonic()<hard_deadline:
             with self.store.connect() as c:
                 row=dict(c.execute('SELECT * FROM net_ops WHERE id=?',(rid,)).fetchone())
                 if row['state']=='done':
                     result=json.loads(row['result'])
+                    if op=='ack':
+                        return self._hand_out(c,rid,args,result,nonce)
                     c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(rid,))
-                    if op=='ack' and (result.get('should_execute') or result.get('kind')=='reply'):
-                        c.execute("UPDATE net_jobs SET state='received' WHERE id=?",(args['message_id'],))
                     return result
                 if row['state']=='failed':
                     c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(rid,))

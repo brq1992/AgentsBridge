@@ -39,10 +39,21 @@ def check_client_directory(directory):
     root = git_worktree(directory)
     if root is None:
         return
+    flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
     try:
-        ignored = subprocess.run(['git', '-C', str(root), 'check-ignore', '-q', '--no-index',
+        # Ignore rules never apply to files already in the index: a tracked token keeps
+        # being committed even after the folder is excluded. Refuse any indexed file there.
+        tracked = subprocess.run(['git', '-C', str(root), 'ls-files', '--', str(directory)],
+                                 capture_output=True, text=True, timeout=15, creationflags=flags)
+        if tracked.returncode != 0:
+            raise BridgeError('cannot verify the git index for the client directory')
+        if tracked.stdout.strip():
+            raise BridgeError('client directory has files tracked by git (' + str(root) + '); run '
+                              '"git rm --cached -r" on it, treat any committed token as exposed, then grant again')
+        # Without --no-index, check-ignore reports only untracked paths that a rule ignores.
+        ignored = subprocess.run(['git', '-C', str(root), 'check-ignore', '-q',
                                   str(directory / 'client.json')], capture_output=True, timeout=15,
-                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).returncode == 0
+                                 creationflags=flags).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         ignored = False
     if not ignored:
@@ -122,9 +133,9 @@ def run(state, hub_config=None):
 
     def handle(path, b, principal=None):
         if principal:
-            if path not in ('/health', '/send', '/ack', '/reply', '/status', '/sessions'):
+            if path not in ('/health', '/send', '/ack', '/ack-receipt', '/reply', '/status', '/sessions'):
                 raise BridgeError('session capability cannot perform administrative operations')
-            if path in ('/send', '/ack', '/reply') or (remote and path == '/status' and b.get('message_id')):
+            if path in ('/send', '/ack', '/ack-receipt', '/reply') or (remote and path == '/status' and b.get('message_id')):
                 if b.get('actor') != principal['id']:
                     raise BridgeError('session capability cannot impersonate another binding')
             if path == '/sessions':
@@ -162,6 +173,10 @@ def run(state, hub_config=None):
                     result['warnings'] = warnings
                 return result
             return {'mode': 'windows-m0-local-only', 'pid': os.getpid(), 'protocol': '1.2'}
+        if path == '/ack-receipt':
+            if not remote:
+                raise BridgeError('claim receipts exist only in M1 network mode')
+            return remote.receipt(b)
         if remote and path in ('/sessions', '/send', '/ack', '/reply', '/status'):
             return remote.forward(path, b, principal)
         if path == '/discover':

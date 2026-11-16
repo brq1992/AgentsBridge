@@ -19,7 +19,13 @@ def exclude_from_git(client):
     if root is None:
         return None
     flags=getattr(subprocess,'CREATE_NO_WINDOW',0)
-    probe=subprocess.run(['git','-C',str(root),'check-ignore','-q','--no-index',str(client/'client.json')],
+    tracked=subprocess.run(['git','-C',str(root),'ls-files','--',str(client)],capture_output=True,text=True,
+                           check=True,creationflags=flags).stdout.strip()
+    if tracked:
+        # Excluding a folder does not remove tracked files; the token may already be exposed.
+        raise BridgeError('client folder has files tracked by git; run "git rm --cached -r" on it and treat '
+                          'any committed token as exposed before granting: '+str(client))
+    probe=subprocess.run(['git','-C',str(root),'check-ignore','-q',str(client/'client.json')],
                          capture_output=True,creationflags=flags)
     if probe.returncode==0:
         return None

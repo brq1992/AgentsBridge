@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory=$true)][string]$InstallDirectory,
     [Parameter(Mandatory=$true)][string]$State,
     [string]$Python,
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$AllowAttached
 )
 # Agent upgrade: installs every release file except the embedded runtime, verified against
 # this release's SOURCE_SHA256.json. Files are staged and checked before the Agent stops;
@@ -24,6 +25,28 @@ function Wait-BridgeHealthy($Python, $Launcher, $StateDir) {
         if ($result -and $result.ok -and $result.result.hub_connected) { return $result }
     } while ((Get-Date) -lt $deadline)
     return $null
+}
+function Get-BridgeDoctor($Python, $Launcher, $StateDir) {
+    $out = & $Python $Launcher --state $StateDir doctor 2>$null
+    try { $result = $out | ConvertFrom-Json } catch { return $null }
+    if ($result -and $result.ok) { return $result.result }
+    return $null
+}
+function Stop-BridgeAgent($Python, $Launcher, $StateDir, [int]$AgentPid) {
+    # Request a normal stop and wait for the process to be gone; never act on a live Agent.
+    & $Python $Launcher --state $StateDir stop 2>$null | Out-Null
+    $deadline = (Get-Date).AddSeconds(60)
+    while ($AgentPid -and (Get-Process -Id $AgentPid -ErrorAction SilentlyContinue)) {
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Milliseconds 250
+    }
+    return $true
+}
+function Start-BridgeAgent($Target, $StateDir, $Python, [switch]$Attached) {
+    $script = Join-Path $Target 'start-m1.ps1'
+    $supports = (Get-Content -Raw -LiteralPath $script) -match 'AllowAttached'
+    if ($Attached -and $supports) { & $script -Mode Agent -State $StateDir -Python $Python -AllowAttached }
+    else { & $script -Mode Agent -State $StateDir -Python $Python }
 }
 $bridgeTarget = [IO.Path]::GetFullPath($InstallDirectory).TrimEnd('\')
 $bridgeState = [IO.Path]::GetFullPath($State)
@@ -62,12 +85,43 @@ print('Installed Store methods to repair: ' + (', '.join(sorted(old_missing)) or
 '@
 & $Python -c $bridgeStoreCheck $PSScriptRoot $bridgeTarget
 if ($LASTEXITCODE -ne 0) { throw 'Store compatibility precheck failed; no installed code or processes changed.' }
+foreach ($bridgeFile in $bridgeFiles) {
+    $existing = Join-Path $bridgeTarget $bridgeFile.Path
+    if (Test-Path -LiteralPath $existing -PathType Container) {
+        throw "Install path $existing is a folder where the release has a file. Nothing was changed."
+    }
+}
 $bridgeChanged = @($bridgeFiles | Where-Object {
     $existing = Join-Path $bridgeTarget $_.Path
-    -not (Test-Path -LiteralPath $existing) -or (Get-BridgeSHA256 $existing) -ne $_.Hash })
+    -not (Test-Path -LiteralPath $existing -PathType Leaf) -or (Get-BridgeSHA256 $existing) -ne $_.Hash })
 $bridgeHealth = & $Python $bridgeLauncher --state $bridgeState doctor | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0 -or -not $bridgeHealth.ok -or $bridgeHealth.result.mode -ne 'windows-m1-network') { throw 'Existing M1 Agent is not reachable.' }
 Write-Output "Release files: $($bridgeFiles.Count); to change: $($bridgeChanged.Count)"
+# Self-contained probe (imports nothing from either release: the installed runtime would
+# resolve 'bridge' to the OLD package). Starts only a no-op child with the breakaway flag.
+$bridgeProbeCode = @'
+import ctypes, os, subprocess, sys
+if os.name != 'nt':
+    print('true'); sys.exit()
+k = ctypes.WinDLL('kernel32')
+k.GetCurrentProcess.restype = ctypes.c_void_p
+k.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+member = ctypes.c_int(0)
+if not k.IsProcessInJob(k.GetCurrentProcess(), None, ctypes.byref(member)) or not member.value:
+    print('true'); sys.exit()
+try:
+    subprocess.Popen([sys.executable, '-c', 'pass'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, creationflags=0x00000008 | 0x01000000).wait(timeout=20)
+    print('true')
+except OSError as e:
+    print('false' if getattr(e, 'winerror', None) == 5 else 'error')
+'@
+$bridgeProbe = (& $Python -c $bridgeProbeCode | Select-Object -Last 1)
+if ($bridgeProbe -notin @('true', 'false')) { throw 'Could not check whether an independent Agent start is possible here. Nothing was changed.' }
+if ($bridgeProbe -eq 'false') {
+    if (-not $AllowAttached) { throw 'Windows refuses an independent Agent start from this shell (its job forbids breakaway). Run the upgrade from a Start-menu PowerShell, or pass -AllowAttached to accept a dependent Agent. Nothing was changed.' }
+    Write-Warning 'Independent start is not possible here; -AllowAttached given, so the Agent depends on the calling program.'
+}
 if ($CheckOnly) { Write-Output 'Checks passed; no files or processes changed.'; return }
 
 $bridgeStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
@@ -90,13 +144,9 @@ foreach ($bridgeFile in $bridgeChanged) {
         Copy-Item -LiteralPath $existing -Destination $saved
     } else { $bridgeAdded += $bridgeFile.Path }
 }
-# 3. Stop the Agent.
-& $Python $bridgeLauncher --state $bridgeState stop | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Agent stop failed; no installed code was changed. Staged files: $bridgeStaging" }
-$bridgeDeadline = (Get-Date).AddSeconds(40)
-while (Get-Process -Id $bridgeHealth.result.pid -ErrorAction SilentlyContinue) {
-    if ((Get-Date) -ge $bridgeDeadline) { throw 'Agent did not exit; refusing to replace code.' }
-    Start-Sleep -Milliseconds 250
+# 3. Stop the Agent and wait until its process is gone.
+if (-not (Stop-BridgeAgent $Python $bridgeLauncher $bridgeState $bridgeHealth.result.pid)) {
+    throw "Agent PID $($bridgeHealth.result.pid) did not exit; no installed code was changed. Staged files: $bridgeStaging"
 }
 # 4. Install, start, verify; roll back on any failure.
 try {
@@ -106,21 +156,46 @@ try {
         Copy-Item -LiteralPath (Join-Path $bridgeStaging $bridgeFile.Path) -Destination $destination -Force
         if ((Get-BridgeSHA256 $destination) -ne $bridgeFile.Hash) { throw "Installed copy mismatch: $($bridgeFile.Path)" }
     }
-    & (Join-Path $bridgeTarget 'start-m1.ps1') -Mode Agent -State $bridgeState -Python $Python
+    Start-BridgeAgent $bridgeTarget $bridgeState $Python -Attached:$AllowAttached
     $bridgeResult = Wait-BridgeHealthy $Python $bridgeLauncher $bridgeState
     if (-not $bridgeResult -or -not $bridgeResult.result.recovery_interval_seconds) { throw 'Upgraded Agent did not become healthy.' }
 } catch {
     $bridgeFailure = $_.Exception.Message
-    & $Python $bridgeLauncher --state $bridgeState stop 2>$null | Out-Null
-    Start-Sleep -Seconds 2
+    # Make sure no upgraded Agent is still running before restoring files under it.
+    $bridgeRunning = Get-BridgeDoctor $Python $bridgeLauncher $bridgeState
+    $bridgeFailedPid = if ($bridgeRunning) { [int]$bridgeRunning.pid } else { 0 }
+    if ($bridgeFailedPid -and -not (Stop-BridgeAgent $Python $bridgeLauncher $bridgeState $bridgeFailedPid)) {
+        throw "Upgrade failed ($bridgeFailure) and ROLLBACK IS INCOMPLETE: upgraded Agent PID $bridgeFailedPid did not exit, so files were NOT restored. Previous files: $bridgeBackup"
+    }
+    $bridgeRestoreAt = Get-Date
+    $bridgeBad = @()
     foreach ($bridgeFile in $bridgeChanged) {
         $destination = Join-Path $bridgeTarget $bridgeFile.Path
         $saved = Join-Path $bridgeBackup $bridgeFile.Path
-        if (Test-Path -LiteralPath $saved) { Copy-Item -LiteralPath $saved -Destination $destination -Force }
-        elseif ($bridgeAdded -contains $bridgeFile.Path) { Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue }
+        try {
+            if (Test-Path -LiteralPath $saved) {
+                Copy-Item -LiteralPath $saved -Destination $destination -Force
+                if ((Get-BridgeSHA256 $destination) -ne (Get-BridgeSHA256 $saved)) { $bridgeBad += $bridgeFile.Path }
+            } elseif ($bridgeAdded -contains $bridgeFile.Path -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
+                Remove-Item -LiteralPath $destination -Force
+            }
+        } catch { $bridgeBad += $bridgeFile.Path }
     }
-    & (Join-Path $bridgeTarget 'start-m1.ps1') -Mode Agent -State $bridgeState -Python $Python
-    throw "Upgrade rolled back ($bridgeFailure). Previous files restored from $bridgeBackup and the previous Agent restarted."
+    if ($bridgeBad.Count) {
+        throw "Upgrade failed ($bridgeFailure) and ROLLBACK IS INCOMPLETE: could not restore $($bridgeBad -join ', '). Agent left stopped. Previous files: $bridgeBackup"
+    }
+    try { Start-BridgeAgent $bridgeTarget $bridgeState $Python -Attached:$AllowAttached } catch { }
+    $bridgeDeadline = (Get-Date).AddSeconds(30)
+    $bridgeOld = $null
+    do {
+        Start-Sleep -Milliseconds 500
+        $bridgeOld = Get-BridgeDoctor $Python $bridgeLauncher $bridgeState
+    } while (-not $bridgeOld -and (Get-Date) -lt $bridgeDeadline)
+    $bridgeOldProcess = if ($bridgeOld) { Get-Process -Id $bridgeOld.pid -ErrorAction SilentlyContinue } else { $null }
+    if (-not $bridgeOldProcess -or $bridgeOld.pid -eq $bridgeFailedPid -or $bridgeOldProcess.StartTime -lt $bridgeRestoreAt) {
+        throw "Upgrade failed ($bridgeFailure). Previous files restored (hash-verified) from $bridgeBackup, but the previous Agent did NOT start; start it manually."
+    }
+    throw "Upgrade rolled back ($bridgeFailure). Previous files restored (hash-verified) from $bridgeBackup; previous Agent running as PID $($bridgeOld.pid) (hub_connected=$($bridgeOld.hub_connected))."
 }
 Remove-Item -LiteralPath $bridgeStaging -Recurse -Force -ErrorAction SilentlyContinue
 $bridgeInstalled = [ordered]@{}

@@ -5,7 +5,7 @@ messages through a small TLS Hub, with durable delivery, explicit claims (ack) a
 Peer messages are data, never a permission grant: each session follows a locally installed policy
 (by default echo-only).
 
-Status: Windows M1, release R4. macOS is not implemented or verified.
+Status: Windows M1, release R5. macOS is not implemented or verified.
 
 ## Layout
 
@@ -26,7 +26,7 @@ Status: Windows M1, release R4. macOS is not implemented or verified.
 
 - `agentbridge/USAGE.md` – how to run it on each machine (Chinese)
 - `agentbridge/M1_WINDOWS.md`, `agentbridge/M1_PROTOCOL.md`, `agentbridge/PROTOCOL.md` – deployment and protocol
-- `agentbridge/RECOVERY.md`, `agentbridge/RELEASE_NOTES_R4.md` – recovery behaviour and R4 changes
+- `agentbridge/RECOVERY.md`, `agentbridge/RELEASE_NOTES_R4.md`, `agentbridge/RELEASE_NOTES_R5.md` – recovery behaviour and release changes
 
 ## Requirements and tests
 
