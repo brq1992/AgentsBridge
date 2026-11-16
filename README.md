@@ -46,3 +46,7 @@ dependencies installed. The launcher tests must run where Windows allows breakin
 ## Never commit
 
 State directories, `network.json`, `client.json`, `ledger.sqlite` / `hub.sqlite`, Hub keys or invitation codes.
+
+## License
+
+MIT, see `LICENSE`.
