@@ -1,0 +1,32 @@
+# Embedded runtime is shipped in release packages only.
+agentbridge/runtime/
+__pycache__/
+*.pyc
+
+# Private state and credentials: never commit.
+state/
+*-state/
+agentbridge-client/
+client.json
+client.tmp
+network.json
+invitation.json
+hub.json
+hub-key.pem
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+qualified-claude.json
+
+# Machine-specific launcher profiles (only profiles.example.json is tracked).
+independent-launcher/*.json
+!independent-launcher/profiles.example.json
+
+# Release artefacts and logs.
+*.zip
+*.zip.sha256
+SOURCE_SHA256.json
+INSTALLED_SHA256.json
+*.log
+upgrade-backup-*/
+.upgrade-staging-*/

@@ -1,0 +1,5 @@
+{
+  "install": "%LOCALAPPDATA%/AgentBridge-M1/agentbridge",
+  "state": "%LOCALAPPDATA%/AgentBridge-M1/state",
+  "python": "%LOCALAPPDATA%/AgentBridge-M1/agentbridge/runtime/python.exe"
+}
