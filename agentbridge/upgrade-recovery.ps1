@@ -42,6 +42,38 @@ function Stop-BridgeAgent($Python, $Launcher, $StateDir, [int]$AgentPid) {
     }
     return $true
 }
+function Wait-BridgeLockFree($Python, $StateDir) {
+    # Self-contained probe of the Agent's exclusive state lock (imports no bridge code).
+    $probe = @'
+import os, sys
+path = os.path.join(sys.argv[1], 'agent.lock')
+if not os.path.exists(path):
+    print('free'); sys.exit()
+try:
+    stream = open(path, 'a+b')
+except OSError:
+    print('held'); sys.exit()
+try:
+    stream.seek(0)
+    if os.name == 'nt':
+        import msvcrt
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(stream, fcntl.LOCK_UN)
+    print('free')
+except OSError:
+    print('held')
+'@
+    $deadline = (Get-Date).AddSeconds(60)
+    do {
+        if ((& $Python -c $probe $StateDir | Select-Object -Last 1) -eq 'free') { return $true }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
 function Start-BridgeAgent($Target, $StateDir, $Python, [switch]$Attached) {
     $script = Join-Path $Target 'start-m1.ps1'
     $supports = (Get-Content -Raw -LiteralPath $script) -match 'AllowAttached'
@@ -136,6 +168,7 @@ foreach ($bridgeFile in $bridgeChanged) {
 }
 # 2. Back up what will be replaced; remember files that are new.
 $bridgeAdded = @()
+$bridgeNewPid = 0
 foreach ($bridgeFile in $bridgeChanged) {
     $existing = Join-Path $bridgeTarget $bridgeFile.Path
     if (Test-Path -LiteralPath $existing) {
@@ -156,17 +189,28 @@ try {
         Copy-Item -LiteralPath (Join-Path $bridgeStaging $bridgeFile.Path) -Destination $destination -Force
         if ((Get-BridgeSHA256 $destination) -ne $bridgeFile.Hash) { throw "Installed copy mismatch: $($bridgeFile.Path)" }
     }
-    Start-BridgeAgent $bridgeTarget $bridgeState $Python -Attached:$AllowAttached
+    # Record the started process from the start script's own output, independent of HTTP health.
+    $bridgeStartText = (Start-BridgeAgent $bridgeTarget $bridgeState $Python -Attached:$AllowAttached | Out-String)
+    Write-Output $bridgeStartText.Trim()
+    if ($bridgeStartText -match 'Agent PID: (\d+)') { $bridgeNewPid = [int]$Matches[1] }
     $bridgeResult = Wait-BridgeHealthy $Python $bridgeLauncher $bridgeState
     if (-not $bridgeResult -or -not $bridgeResult.result.recovery_interval_seconds) { throw 'Upgraded Agent did not become healthy.' }
 } catch {
     $bridgeFailure = $_.Exception.Message
-    # Make sure no upgraded Agent is still running before restoring files under it.
+    # Never restore files under a live Agent. Candidates: whatever doctor reports, plus the
+    # PID the start script printed; then the state lock itself must be free, which also covers
+    # an Agent that is alive but whose health endpoint does not answer.
     $bridgeRunning = Get-BridgeDoctor $Python $bridgeLauncher $bridgeState
-    $bridgeFailedPid = if ($bridgeRunning) { [int]$bridgeRunning.pid } else { 0 }
-    if ($bridgeFailedPid -and -not (Stop-BridgeAgent $Python $bridgeLauncher $bridgeState $bridgeFailedPid)) {
-        throw "Upgrade failed ($bridgeFailure) and ROLLBACK IS INCOMPLETE: upgraded Agent PID $bridgeFailedPid did not exit, so files were NOT restored. Previous files: $bridgeBackup"
+    $bridgeCandidates = @(@($(if ($bridgeRunning) { [int]$bridgeRunning.pid }), $bridgeNewPid) | Where-Object { $_ } | Select-Object -Unique)
+    foreach ($bridgeCandidate in $bridgeCandidates) {
+        if (-not (Stop-BridgeAgent $Python $bridgeLauncher $bridgeState $bridgeCandidate)) {
+            throw "Upgrade failed ($bridgeFailure) and ROLLBACK IS INCOMPLETE: Agent PID $bridgeCandidate did not exit, so files were NOT restored. Previous files: $bridgeBackup"
+        }
     }
+    if (-not (Wait-BridgeLockFree $Python $bridgeState)) {
+        throw "Upgrade failed ($bridgeFailure) and ROLLBACK IS INCOMPLETE: a process still holds the Agent state lock (agent.lock) and could not be identified as stopped, so files were NOT restored. Previous files: $bridgeBackup"
+    }
+    $bridgeFailedPid = if ($bridgeCandidates.Count) { [int]$bridgeCandidates[0] } else { 0 }
     $bridgeRestoreAt = Get-Date
     $bridgeBad = @()
     foreach ($bridgeFile in $bridgeChanged) {

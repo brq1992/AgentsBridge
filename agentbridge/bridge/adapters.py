@@ -243,27 +243,93 @@ def prepare(session, text):
     raise BridgeError('unknown adapter')
 
 
-def write_pipe(path, token, text):
+def claude_status(session):
+    """The runtime's own busy/idle flag for the bound process, or None if unknown.
+
+    Claude Code may hold or drop a peer message that arrives while the session is busy;
+    re-notification is only attempted when this reports 'idle'.
+    """
+    try:
+        meta = json.loads(session['metadata'])
+        r = json.loads(Path(meta['registry']).read_text(encoding='utf8'))
+        if r.get('pid') != meta.get('pid') or session['native_id'] not in claude_session_ids(r):
+            return None
+        status = r.get('status')
+        return status if isinstance(status, str) else None
+    except (OSError, ValueError, KeyError, BridgeError):
+        return None
+
+
+RECEIPT_WAIT = 1.5
+
+
+def _summarize_receipt(raw):
+    """Only structural fields of whatever the runtime answers; never echo text back."""
+    kept = []
+    for line in raw.decode('utf8', 'replace').splitlines()[:8]:
+        try:
+            item = json.loads(line)
+        except ValueError:
+            kept.append({'unparsed_bytes': len(line)})
+            continue
+        if isinstance(item, dict):
+            kept.append({k: item[k] for k in ('type', 'status', 'state', 'result', 'reason', 'outcome')
+                         if k in item and isinstance(item[k], (str, int, bool))})
+    return kept
+
+
+def write_pipe(path, token, text, receipt_wait=RECEIPT_WAIT):
     k = ctypes.WinDLL('kernel32', use_last_error=True)
     k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
     k.CreateFileW.restype = wintypes.HANDLE
     k.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
     k.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    k.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    k.PeekNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                                ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
     k.CloseHandle.argtypes = [wintypes.HANDLE]
     if not k.WaitNamedPipeW(path, 2000):
         raise OSError('native pipe unavailable before opening')
-    handle = k.CreateFileW(path, 0x40000000, 0, None, 3, 0, None)
+    readable = True
+    handle = k.CreateFileW(path, 0xC0000000, 0, None, 3, 0, None)          # read + write: to see a receipt
+    if handle == ctypes.c_void_p(-1).value:
+        readable = False
+        handle = k.CreateFileW(path, 0x40000000, 0, None, 3, 0, None)      # write-only, as before
     if handle == ctypes.c_void_p(-1).value:
         raise OSError('cannot open native pipe')
+    receipt = []
     try:
         payload = (json.dumps({'type': 'auth', 'token': token}) + '\n' +
                    json.dumps({'type': 'user', 'message': {'role': 'user', 'content': text}}, ensure_ascii=False) + '\n').encode('utf8')
         sent = wintypes.DWORD()
         if not k.WriteFile(handle, payload, len(payload), ctypes.byref(sent), None) or sent.value != len(payload):
             raise OSError('native pipe write incomplete')
+        if readable and receipt_wait > 0:
+            # Poll without blocking: the runtime may answer (e.g. held/expired) or stay silent.
+            import time as _time
+            data = b''
+            deadline = _time.monotonic() + receipt_wait
+            available = wintypes.DWORD()
+            while _time.monotonic() < deadline and len(data) < 65536:
+                if not k.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
+                    break
+                if available.value:
+                    buffer = ctypes.create_string_buffer(min(available.value, 65536))
+                    got = wintypes.DWORD()
+                    if not k.ReadFile(handle, buffer, len(buffer), ctypes.byref(got), None):
+                        break
+                    data += buffer.raw[:got.value]
+                    if data.endswith(b'\n'):
+                        break
+                else:
+                    _time.sleep(0.05)
+            receipt = _summarize_receipt(data) if data else []
     finally:
         k.CloseHandle(handle)
-    return {'transport': 'named_pipe', 'meaning': 'written_not_confirmed'}
+    result = {'transport': 'named_pipe', 'meaning': 'written_not_confirmed'}
+    if readable:
+        result['receipt'] = receipt or 'none_within_%.1fs' % receipt_wait
+    return result
 
 
 def deliver(prepared):

@@ -65,6 +65,13 @@ class RemoteAgent:
                 c.execute('ALTER TABLE net_ops ADD COLUMN handed INTEGER NOT NULL DEFAULT 0')
             if 'claim_nonce' not in columns:
                 c.execute('ALTER TABLE net_ops ADD COLUMN claim_nonce TEXT')
+            if 'consumed_by' not in columns:
+                # who received execution permission: 'legacy', a claim nonce, or 'closed'
+                c.execute('ALTER TABLE net_ops ADD COLUMN consumed_by TEXT')
+            job_columns={r['name'] for r in c.execute('PRAGMA table_info(net_jobs)')}
+            for name,ddl in (('notified_at','REAL'),('notify_count','INTEGER NOT NULL DEFAULT 0'),('last_receipt','TEXT')):
+                if name not in job_columns:
+                    c.execute(f'ALTER TABLE net_jobs ADD COLUMN {name} {ddl}')
             for r in c.execute("SELECT * FROM net_jobs WHERE state='submitting'").fetchall():
                 self._phase(c,r['id'],'delivery_uncertain',{'reason':'Agent restarted during native submission'})
         self._pruned_at=0.0
@@ -131,48 +138,116 @@ class RemoteAgent:
     def _hand_out(self,c,rid,args,result,nonce):
         """Atomically give a finished ack result to exactly one caller.
 
-        Without a nonce the result is consumed now (single winner via handed=0 guard).
-        With a nonce (the CLI) an execution permission is only offered: it is consumed by
-        a successful /ack-receipt, so a lost response leaves it available to the next ack.
+        Without a nonce (a legacy caller) the result is consumed now: one winner via the
+        handed=0 guard, recorded as consumed_by='legacy'. With a nonce (the CLI) an execution
+        permission is only offered; a successful /ack-receipt consumes it and records that
+        exact nonce in consumed_by. consumed_by is the single source of truth for who may
+        execute: a receipt is replayed as success only for the nonce recorded there.
         """
         if not result.get('should_execute'):
-            c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(rid,))
+            self._close(c,rid)
             if result.get('kind')=='reply':
                 c.execute("UPDATE net_jobs SET state='received' WHERE id=?",(args['message_id'],))
             return result
         invalid=self._claim_still_valid(c,args)
         if invalid:
-            c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(rid,))
+            self._close(c,rid)
             return {'should_execute':False,'reason':invalid,'operation_id':rid}
         if nonce:
             if not c.execute('UPDATE net_ops SET claim_nonce=? WHERE id=? AND handed=0',(nonce,rid)).rowcount:
                 return {'should_execute':False,'reason':'claim_already_received','operation_id':rid}
             return dict(result,claim_receipt=rid)
-        if not c.execute('UPDATE net_ops SET handed=1 WHERE id=? AND handed=0',(rid,)).rowcount:
+        if not c.execute("UPDATE net_ops SET handed=1,consumed_by='legacy' WHERE id=? AND handed=0",(rid,)).rowcount:
             return {'should_execute':False,'reason':'claim_already_received','operation_id':rid}
         c.execute("UPDATE net_jobs SET state='received' WHERE id=?",(args['message_id'],))
         return result
 
+    @staticmethod
+    def _close(c,rid):
+        """Mark an operation finished without granting execution to anyone."""
+        c.execute("UPDATE net_ops SET handed=1,consumed_by=COALESCE(consumed_by,'closed') WHERE id=?",(rid,))
+
     def receipt(self,b):
-        """Consume an offered claim for the caller holding its nonce (idempotent for it)."""
+        """Consume an offered claim for the caller holding its nonce.
+
+        Succeeds only if the claim is still unconsumed and offered to this nonce, or if this
+        exact nonce already consumed it (idempotent replay of its own success). Any other
+        consumer (a legacy caller, another nonce, a closed claim) means rejection.
+        """
         rid,nonce=b.get('operation_id'),b.get('claim_nonce')
         with self.store.connect() as c:
             actor=self.store._session(c,b['actor'])
             row=c.execute("SELECT * FROM net_ops WHERE id=? AND op='ack' AND state='done'",(rid,)).fetchone()
-            if not row or not nonce or row['claim_nonce']!=nonce:
-                raise BridgeError('claim receipt rejected: not offered to this caller')
+            if not row or not nonce:
+                raise BridgeError('claim receipt rejected: unknown claim')
             args=json.loads(row['args'])
             if args['actor']!=self.node_id+':'+actor['id']:
                 raise BridgeError('claim receipt rejected: different session')
             if row['handed']:
-                return {'receipt':True,'operation_id':rid}
+                if row['consumed_by']==nonce:
+                    return {'receipt':True,'operation_id':rid,'replayed':True}
+                raise BridgeError('claim receipt rejected: already received by another caller')
+            if row['claim_nonce']!=nonce:
+                raise BridgeError('claim receipt rejected: not offered to this caller')
             invalid=self._claim_still_valid(c,args)
             if invalid:
-                c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(rid,))
+                self._close(c,rid)
                 raise BridgeError('claim receipt rejected: '+invalid)
-            c.execute('UPDATE net_ops SET handed=1 WHERE id=? AND handed=0 AND claim_nonce=?',(rid,nonce))
+            if not c.execute('UPDATE net_ops SET handed=1,consumed_by=? WHERE id=? AND handed=0 AND claim_nonce=?',
+                             (nonce,rid,nonce)).rowcount:
+                raise BridgeError('claim receipt rejected: already received by another caller')
             c.execute("UPDATE net_jobs SET state='received' WHERE id=?",(args['message_id'],))
             return {'receipt':True,'operation_id':rid}
+
+    # Claude Code may hold or drop a peer message that arrives while the session is busy
+    # (its own receipts say held/expired). A notification that was written but never
+    # claimed is written again once the session is idle. Execution is still gated by the
+    # ack claim, so a duplicate notification cannot run a request twice.
+    RENOTIFY_AFTER=(60,180,600)
+    RENOTIFY_HEADER=('[AgentBridge re-notification {n}/{total}: an earlier delivery of this message may not '
+                     'have been shown. If it was already handled, ack returns should_execute=false; then do nothing more.]\n')
+
+    def renotify(self,now=None):
+        now=now or time.time()
+        sent=[]
+        with self.store.connect() as c:
+            rows=[dict(r) for r in c.execute("""SELECT id,envelope,notified_at,notify_count FROM net_jobs
+                WHERE state='submitted' AND notified_at IS NOT NULL AND notify_count<?""",(len(self.RENOTIFY_AFTER),))]
+        for row in rows:
+            m=json.loads(row['envelope'])
+            if m.get('expires',0)<=now or now-row['notified_at']<self.RENOTIFY_AFTER[row['notify_count']]:
+                continue
+            local_id=m['receiver'].removeprefix(self.node_id+':')
+            with self.store.connect() as c:
+                current=c.execute('SELECT * FROM sessions WHERE id=?',(local_id,)).fetchone()
+                state=c.execute('SELECT state FROM net_jobs WHERE id=?',(row['id'],)).fetchone()
+            if (not current or not current['enabled'] or current['tool']!='claude'
+                    or current['generation']!=m['receiver_gen'] or not state or state[0]!='submitted'):
+                continue
+            session=dict(current)
+            if adapters.claude_status(session)!='idle':
+                continue
+            n=row['notify_count']+1
+            try:
+                text=self.RENOTIFY_HEADER.format(n=n,total=len(self.RENOTIFY_AFTER))+adapters.envelope(
+                    m,session,self.store.client_directory(local_id,self.state))
+                detail=adapters.deliver(adapters.prepare(session,text))
+            except Exception:
+                continue          # endpoint not ready; the normal recovery path handles it
+            with self.store.connect() as c:
+                c.execute("""UPDATE net_jobs SET notified_at=?,notify_count=?,last_receipt=?
+                    WHERE id=? AND state='submitted'""",(time.time(),n,json.dumps(detail.get('receipt')),row['id']))
+            sent.append(row['id'])
+        return sent
+
+    def unclaimed(self,now=None,after=60):
+        """Claude notifications written but not claimed for more than `after` seconds."""
+        now=now or time.time()
+        with self.store.connect() as c:
+            rows=c.execute("""SELECT id,notified_at,notify_count,last_receipt FROM net_jobs
+                WHERE state='submitted' AND notified_at IS NOT NULL AND notified_at<?""",(now-after,)).fetchall()
+        return [{'message_id':r['id'],'age_seconds':int(now-r['notified_at']),'renotified':r['notify_count'],
+                 'last_receipt':json.loads(r['last_receipt']) if r['last_receipt'] else None} for r in rows]
 
     OUTBOX_RETENTION=7*86400
 
@@ -271,7 +346,7 @@ class RemoteAgent:
                     AND json_extract(args,'$.generation')=?
                     ORDER BY seq DESC LIMIT 1""",(args['message_id'],args['actor'],args['generation'])).fetchone()
                 if previous and previous['state']=='failed':
-                    c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(previous['id'],))
+                    self._close(c,previous['id'])
                 elif previous:
                     rid=previous['id']
             if rid is None:
@@ -289,10 +364,10 @@ class RemoteAgent:
                     result=json.loads(row['result'])
                     if op=='ack':
                         return self._hand_out(c,rid,args,result,nonce)
-                    c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(rid,))
+                    self._close(c,rid)
                     return result
                 if row['state']=='failed':
-                    c.execute('UPDATE net_ops SET handed=1 WHERE id=?',(rid,))
+                    self._close(c,rid)
                     raise BridgeError(row['error'])
             if time.monotonic()>=deadline and row['state']!='sending':
                 break
@@ -403,6 +478,10 @@ class RemoteAgent:
                     # Temporary database contention must not kill delivery.
                     pass
                 self._recovery_at=time.monotonic()+self.recovery_interval
+                try:
+                    self.renotify()
+                except Exception:
+                    pass
                 if time.monotonic()>=self._pruned_at:
                     try:
                         self.prune()
@@ -446,4 +525,7 @@ class RemoteAgent:
                 phase='delivery_uncertain'
             with self.store.connect() as c:
                 self._phase(c,m['id'],phase,detail)
+                if phase=='submitted':
+                    c.execute('UPDATE net_jobs SET notified_at=?,last_receipt=? WHERE id=?',
+                              (time.time(),json.dumps(detail.get('receipt')) if isinstance(detail,dict) else None,m['id']))
             self.wake.set()

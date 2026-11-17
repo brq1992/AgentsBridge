@@ -150,6 +150,42 @@ class UpgradeFailureTests(unittest.TestCase):
         self.assertFalse((self.install / 'configure-m1-session.py').is_file())
         self.assertIsNone(self.health(), 'Agent must be left stopped when the rollback is incomplete')
 
+    def test_unreachable_agent_holding_the_lock_blocks_restore(self):
+        # Stand-in for an upgraded Agent that is alive but whose health endpoint never
+        # answers: as soon as the old Agent releases agent.lock, another process holds it.
+        import msvcrt
+        stop = threading.Event()
+        held = threading.Event()
+        def hold_lock():
+            stream = (self.state / 'agent.lock').open('a+b')
+            while not stop.is_set():
+                try:
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                    held.set()
+                    break
+                except OSError:
+                    time.sleep(0.02)
+            stop.wait()
+            if held.is_set():
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            stream.close()
+        holder = threading.Thread(target=hold_lock, daemon=True)
+        holder.start()
+        try:
+            code, text = self.upgrade('-AllowAttached')
+        finally:
+            stop.set()
+            holder.join(10)
+        self.assertTrue(held.is_set(), 'test did not get the lock: ' + text)
+        self.assertNotEqual(code, 0, text)
+        self.assertIn('ROLLBACK IS INCOMPLETE', text)
+        self.assertIn('agent.lock', text)
+        # Files were left as installed (not restored under an unidentified lock holder).
+        self.assertEqual(self.marker.read_bytes(), (SOURCE / 'bridge' / 'store.py').read_bytes())
+        self.assertIsNone(self.health())
+
     def test_without_independent_start_nothing_changes(self):
         if breakaway_possible():
             self.skipTest('this environment allows an independent start')

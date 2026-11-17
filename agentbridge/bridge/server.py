@@ -170,6 +170,14 @@ def run(state, hub_config=None):
                             warnings.append('Hub certificate expires in ' + str(expiry['days_left']) + ' days')
                     except Exception:
                         pass
+                    try:
+                        waiting = remote.unclaimed()
+                        result['unclaimed_messages'] = waiting
+                        if waiting:
+                            warnings.append(str(len(waiting)) + ' delivered message(s) not yet claimed by the '
+                                            'receiving session; they are re-notified when it is idle')
+                    except Exception:
+                        pass
                     result['warnings'] = warnings
                 return result
             return {'mode': 'windows-m0-local-only', 'pid': os.getpid(), 'protocol': '1.2'}
