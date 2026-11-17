@@ -74,6 +74,57 @@ class RenotifyTests(ClaimFixture, unittest.TestCase):
         self.assertEqual(self.agent.renotify(), [])
         self.assertEqual(self.sent, [])
 
+    def test_uncertain_write_is_counted_and_backs_off(self):
+        attempts = []
+        def uncertain(prepared):
+            attempts.append(prepared)
+            raise OSError('synthetic failure after the native write may have happened')
+        with patch('bridge.network.adapters.deliver', side_effect=uncertain):
+            for _ in range(5):
+                self.agent.renotify()
+            self.assertEqual(len(attempts), 1, 'repeated passes inside the back-off must not write again')
+            self.assertEqual((self.job()['notify_count'], self.job()['renotify_state']), (1, 'uncertain'))
+            for offset in (181, 800, 2000, 5000):
+                self.agent.renotify(now=time.time() + offset)
+        self.assertEqual(len(attempts), 3, 'never more than three attempts, even when every write fails')
+        self.assertEqual(self.job()['notify_count'], 3)
+
+    def test_preflight_failure_is_not_an_attempt(self):
+        with patch('bridge.network.adapters.prepare', side_effect=OSError('endpoint not ready')):
+            for _ in range(3):
+                self.agent.renotify()
+        self.assertEqual(self.sent, [])
+        self.assertEqual((self.job()['notify_count'], self.job()['renotify_state']), (0, None))
+
+    def test_crash_during_write_stays_counted_after_restart(self):
+        from bridge.network import RemoteAgent
+        class Crash(BaseException):
+            pass
+        with patch('bridge.network.adapters.deliver', side_effect=Crash()):
+            with self.assertRaises(Crash):
+                self.agent.renotify()
+        self.assertEqual((self.job()['notify_count'], self.job()['renotify_state']), (1, 'attempting'))
+        restarted = RemoteAgent(self.store, self.agent.state, self.agent.state / 'network.json', self.agent.stop,
+                                {'machine_id': '00000000-0000-4000-8000-000000000000', 'os_user_id': 'u'})
+        self.assertEqual(self.job()['renotify_state'], 'uncertain')
+        self.assertEqual(restarted.renotify(), [], 'restart must respect the back-off of the counted attempt')
+        self.assertEqual(self.sent, [])
+
+    def test_concurrent_passes_claim_one_attempt(self):
+        import threading
+        def slow(prepared):
+            time.sleep(0.3)
+            self.sent.append(prepared[1])
+            return {'receipt': None}
+        with patch('bridge.network.adapters.deliver', side_effect=slow):
+            threads = [threading.Thread(target=self.agent.renotify) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual((self.job()['notify_count'], self.job()['renotify_state']), (1, 'sent'))
+
     def test_unclaimed_report(self):
         report = self.agent.unclaimed()
         self.assertEqual([r['message_id'] for r in report], ['m_abandoned'])

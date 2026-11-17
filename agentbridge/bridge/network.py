@@ -69,9 +69,12 @@ class RemoteAgent:
                 # who received execution permission: 'legacy', a claim nonce, or 'closed'
                 c.execute('ALTER TABLE net_ops ADD COLUMN consumed_by TEXT')
             job_columns={r['name'] for r in c.execute('PRAGMA table_info(net_jobs)')}
-            for name,ddl in (('notified_at','REAL'),('notify_count','INTEGER NOT NULL DEFAULT 0'),('last_receipt','TEXT')):
+            for name,ddl in (('notified_at','REAL'),('notify_count','INTEGER NOT NULL DEFAULT 0'),('last_receipt','TEXT'),('renotify_state','TEXT')):
                 if name not in job_columns:
                     c.execute(f'ALTER TABLE net_jobs ADD COLUMN {name} {ddl}')
+            # A re-notification interrupted by a crash may or may not have been written; it was
+            # already counted before the write, so it only needs its outcome marked uncertain.
+            c.execute("UPDATE net_jobs SET renotify_state='uncertain' WHERE renotify_state='attempting'")
             for r in c.execute("SELECT * FROM net_jobs WHERE state='submitting'").fetchall():
                 self._phase(c,r['id'],'delivery_uncertain',{'reason':'Agent restarted during native submission'})
         self._pruned_at=0.0
@@ -228,15 +231,30 @@ class RemoteAgent:
             if adapters.claude_status(session)!='idle':
                 continue
             n=row['notify_count']+1
+            # 1. Preflight only (nothing written): a failure here is not an attempt.
             try:
                 text=self.RENOTIFY_HEADER.format(n=n,total=len(self.RENOTIFY_AFTER))+adapters.envelope(
                     m,session,self.store.client_directory(local_id,self.state))
-                detail=adapters.deliver(adapters.prepare(session,text))
+                prepared=adapters.prepare(session,text)
             except Exception:
                 continue          # endpoint not ready; the normal recovery path handles it
+            # 2. Record the attempt BEFORE crossing the native boundary (compare-and-set on
+            #    the count), so an error or crash during the write still counts toward the
+            #    back-off and the limit, and two passes cannot both claim the same attempt.
             with self.store.connect() as c:
-                c.execute("""UPDATE net_jobs SET notified_at=?,notify_count=?,last_receipt=?
-                    WHERE id=? AND state='submitted'""",(time.time(),n,json.dumps(detail.get('receipt')),row['id']))
+                claimed=c.execute("""UPDATE net_jobs SET notified_at=?,notify_count=?,renotify_state='attempting'
+                    WHERE id=? AND state='submitted' AND notify_count=?""",(time.time(),n,row['id'],n-1)).rowcount
+            if not claimed:
+                continue
+            # 3. Write; the outcome only labels the attempt, it never refunds it.
+            try:
+                detail=adapters.deliver(prepared)
+                outcome,receipt='sent',json.dumps(detail.get('receipt') if isinstance(detail,dict) else None)
+            except Exception as e:
+                outcome,receipt='uncertain',json.dumps({'error':type(e).__name__})
+            with self.store.connect() as c:
+                c.execute("UPDATE net_jobs SET renotify_state=?,last_receipt=? WHERE id=? AND notify_count=?",
+                          (outcome,receipt,row['id'],n))
             sent.append(row['id'])
         return sent
 
@@ -244,9 +262,9 @@ class RemoteAgent:
         """Claude notifications written but not claimed for more than `after` seconds."""
         now=now or time.time()
         with self.store.connect() as c:
-            rows=c.execute("""SELECT id,notified_at,notify_count,last_receipt FROM net_jobs
+            rows=c.execute("""SELECT id,notified_at,notify_count,last_receipt,renotify_state FROM net_jobs
                 WHERE state='submitted' AND notified_at IS NOT NULL AND notified_at<?""",(now-after,)).fetchall()
-        return [{'message_id':r['id'],'age_seconds':int(now-r['notified_at']),'renotified':r['notify_count'],
+        return [{'message_id':r['id'],'age_seconds':int(now-r['notified_at']),'renotified':r['notify_count'],'renotify_state':r['renotify_state'],
                  'last_receipt':json.loads(r['last_receipt']) if r['last_receipt'] else None} for r in rows]
 
     OUTBOX_RETENTION=7*86400
