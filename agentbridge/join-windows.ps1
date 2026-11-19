@@ -73,9 +73,6 @@ do {
     if ($bridgeStatus.ok -and $bridgeStatus.result.hub_connected) { break }
 } while ((Get-Date) -lt $bridgeDeadline)
 if (-not $bridgeStatus.result.hub_connected) { throw 'Agent started but Hub is not connected; inspect private Agent.stderr.log and status' }
-& $bridgePython (Join-Path $PSScriptRoot 'tools\install_skill.py') --state $bridgeState --python $bridgePython
-if ($LASTEXITCODE -ne 0) { throw 'agentbridge skill installation failed' }
-Write-Host 'Installed the agentbridge skill: in any Claude/Codex chat say "use agentbridge to bind this session as <name>".'
 Write-Host 'Agent connected. Select existing sessions; blank input skips a tool.'
 $bridgeDiscovered = & $Python $bridgeLauncher --state $bridgeState discover | ConvertFrom-Json
 $bridgeDiscovered.result | Select-Object sessionId,name,cwd,version | Format-Table -AutoSize

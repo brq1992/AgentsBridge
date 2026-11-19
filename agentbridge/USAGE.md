@@ -43,16 +43,16 @@ AgentBridge 让多台 Windows 机器上**已经打开的原会话**（Claude Cod
 
 多台机器不要同时关 Agent；需要重启时一台做完、doctor 正常后再做下一台。
 
-## 2a. 在对话里用 agentbridge skill（推荐）
+## 2a. 在对话里用 agentbridge skill（个人可选）
 
-`join-windows.ps1` 接入时会把 `agentbridge` skill 装到 `~/.claude/skills` 和 `~/.codex/skills`；也可以手动安装：
+不随接入自动安装。需要的人自己装到用户目录 `~/.claude/skills` 和 `~/.codex/skills`（不进任何项目仓库）：
 ```powershell
-& "$bridgeRootuntime\python.exe" "$bridgeRoot	ools\install_skill.py" --state "$bridgeState"
+& "$bridgeRoot\runtime\python.exe" "$bridgeRoot\tools\install_skill.py" --state "$bridgeState"
 ```
-之后在任意 Claude / Codex 对话里直接说：
+它只在手动调用时生效（Claude 输入 `/agentbridge …`），AI 不会自己选用。例如：
 
-- “用 agentbridge 把这个会话绑定为 claude3”：AI 运行 `bind-self --alias claude3`，自动识别本会话（Codex 读 `CODEX_THREAD_ID`，Claude 从父进程找到本会话的注册项），项目默认取 `site.json` 的 `project`，没有则 `agentbridge-m0`，并把会话客户端发到 `<state 同级>\clients\claude3gentbridge-client`。返回完整地址如 `node-a/claude3`。
-- “跟 node-b/codex 说 ……”：AI 先 `list` 找到唯一匹配的地址，再用本会话客户端 `send`。名字对不上或有歧义会先问你。
+- `/agentbridge 把这个会话绑定为 claude3`：AI 运行 `bind-self --alias claude3`，自动识别本会话（Codex 读 `CODEX_THREAD_ID`，Claude 从父进程找到本会话的注册项），项目默认取 `site.json` 的 `project`，没有则 `agentbridge-m0`，会话客户端放在 `<state 同级>\clients\claude3\agentbridge-client`。返回完整地址如 `node-a/claude3`。
+- `/agentbridge 跟 node-b/codex 说 ……`：AI 先 `list` 找到唯一匹配的地址，再用本会话客户端 `send`。名字对不上或有歧义会先问你。
 - 收到的非 echo 消息只转告你，不会自动执行。
 
 `bind-self` 只能绑定执行它的会话本身，不接受 `--tool` / `--session`；别名被别的会话占用时直接报错。绑定其他会话仍用 `bind`。

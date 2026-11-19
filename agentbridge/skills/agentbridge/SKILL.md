@@ -1,6 +1,7 @@
 ---
 name: agentbridge
-description: 把当前会话绑定到本机 AgentBridge Agent / Hub，按用户给的名字给其他已绑定会话发消息，以及处理收到的 AgentBridge 消息。用户说"绑定这个会话""把本会话接入 agentbridge""发给 / 跟 XX 说""用 agentbridge"，或会话里出现 [AgentBridge M1 peer data …] 时使用。
+description: 仅在用户手动输入 /agentbridge 时使用：把当前会话绑定到本机 AgentBridge，给已绑定会话发消息，处理收到的消息。不要自动选用。
+disable-model-invocation: true
 ---
 
 # AgentBridge
