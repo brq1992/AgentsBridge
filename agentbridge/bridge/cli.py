@@ -151,6 +151,10 @@ def main():
     bind.add_argument('--project', required=True)
     bind.add_argument('--cli', default=shutil.which('codex'))
     bind.add_argument('--codex-home', default=os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
+    bind_self = sub.add_parser('bind-self', help='Bind the calling conversation itself (identity detected) and grant its client')
+    bind_self.add_argument('--alias', required=True)
+    bind_self.add_argument('--project', help='Default: site.json "project", else agentbridge-m0')
+    bind_self.add_argument('--client-directory', help='Default: <state parent>/clients/<alias>/agentbridge-client')
     unbind = sub.add_parser('unbind')
     unbind.add_argument('--alias', required=True)
     refresh = sub.add_parser('refresh-claude')
@@ -200,6 +204,13 @@ def main():
                 result = {'independent_start_possible': breakaway_possible()}
             else:
                 result = agent_start(args.state, args.hub_config, allow_attached=args.allow_attached)
+            print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))
+            return
+        if args.command == 'bind-self':
+            from .selfbind import bind_self
+            if args.tool or args.session:
+                raise BridgeError('bind-self detects the calling conversation; use bind for any other session')
+            result = bind_self(args.state, args.alias, args.project, args.client_directory)
             print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))
             return
         tool = args.tool or ('codex' if os.environ.get('CODEX_THREAD_ID') else None)
