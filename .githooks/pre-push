@@ -1,0 +1,4 @@
+#!/bin/sh
+# Enable once per clone: git config core.hooksPath .githooks
+# Set AGENTBRIDGE_SITE to your private site.json to also check its deny list.
+exec python agentbridge/tools/check_public.py

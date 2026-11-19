@@ -1,0 +1,5 @@
+{
+  "hub_url": "wss://192.0.2.10:9741",
+  "hub_fingerprint": "<sha256 hex of the Hub certificate DER>",
+  "deny": ["<words that must never reach the public repository: machine names, internal domains>"]
+}

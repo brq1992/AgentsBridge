@@ -1,0 +1,15 @@
+{
+  "python": "3.14.10",
+  "architecture": "win_amd64",
+  "url": "https://www.python.org/ftp/python/3.14.10/python-3.14.10-embed-amd64.zip",
+  "official_archive_sha256": "90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159",
+  "authenticode_signer": "Python Software Foundation",
+  "authenticode_status": "Valid",
+  "dependencies": {
+    "websockets": "17.4",
+    "cryptography": "50.0.2",
+    "cffi": "2.1.1",
+    "pycparser": "3.12"
+  },
+  "configuration": "private embedded runtime with vendored packages; no pip, PATH or registry changes"
+}

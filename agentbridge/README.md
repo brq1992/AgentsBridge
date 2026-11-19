@@ -1,6 +1,6 @@
 # AgentBridge Windows M0 / M1
 
-M1 network Hub and Windows Agent are implemented. Start with [M1_WINDOWS.md](M1_WINDOWS.md) and [M1_PROTOCOL.md](M1_PROTOCOL.md). Instructions below describe the preserved local M0 mode. The original M0 archive is unchanged; real two-machine M1 acceptance is tracked separately.
+M1 network Hub and Windows Agent are implemented. Start with [M1_WINDOWS.md](M1_WINDOWS.md) and [M1_PROTOCOL.md](M1_PROTOCOL.md). Deployment-specific values (Hub address, certificate, machine names) are kept out of this repository: see [SITE_CONFIG.md](SITE_CONFIG.md). Instructions below describe the preserved local M0 mode. The original M0 archive is unchanged; real two-machine M1 acceptance is tracked separately.
 
 Python 3.11+; standard library only. Run from the existing desktop session, never a new `codex exec` or `claude -p` business session. Protocol corrections and exact guarantees are in [PROTOCOL.md](PROTOCOL.md).
 

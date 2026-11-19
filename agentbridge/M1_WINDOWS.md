@@ -14,7 +14,7 @@ v2 Windows x64 接入包自带 Python 3.14.10 和固定依赖，直接使用包�
 ## 第二台接入
 
 1. 按交付命令核对 ZIP SHA-256，解压到第二台本地目录。不要长期从共享目录执行可被别人改写的代码。
-2. 运行 `join-windows.ps1 -Hub wss://HUB_HOST:9741 -Code 接入码 -Fingerprint 证书指纹`。v2 包直接使用内置运行环境；脚本验证证书、领取节点令牌、启动隐藏 Agent。无需管理员权限、计划任务、系统启动项或远端入站端口。可加 `-CheckRuntime` 只检查运行环境，不领取凭据。
+2. 运行 `join-windows.ps1 -Hub wss://HUB_HOST:9741 -Code 接入码 -Fingerprint 证书指纹`。v2 包直接使用内置运行环境；脚本验证证书、领取节点令牌、启动隐藏 Agent。无需管理员权限、计划任务、系统启动项或远端入站端口。可加 `-CheckRuntime` 只检查运行环境，不领取凭据。内部部署包自带 `site.json` 时可省略 `-Hub` 和 `-Fingerprint`（见 SITE_CONFIG.md）。
 3. 选择列表中的原 Claude UUID。脚本为其工作区添加三个固定 Python/脚本/UUID 的 Bash 规则，仅允许 ack、reply 和发往指定测试会话的 send；保留其他设置、入站策略与权限模式。备份和规则增量存在私有状态。
 4. 在原 Codex 测试会话获取 `CODEX_THREAD_ID`、工作目录及 `whoami /user` 的实际工具 SID，输入脚本。客户端仅有该会话的权限；SID 得到源码读/执行权，不开放管理状态。
 5. 将脚本打印的授权文字发到所选原会话。它读取本地 M1 echo 政策，发一次请求，后续先 ack 再 echo reply，最终回复只 ack。已有旧审批可能仍需人工释放一次。

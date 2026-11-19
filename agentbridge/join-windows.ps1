@@ -1,14 +1,23 @@
 param(
     [Parameter(Mandatory=$true)][string]$Code,
-    [Parameter(Mandatory=$true)][string]$Hub,
+    [string]$Hub,
     [string]$ClaudePeer,
     [string]$CodexPeer,
-    [Parameter(Mandatory=$true)][string]$Fingerprint,
+    [string]$Fingerprint,
     [string]$Install = (Join-Path $env:LOCALAPPDATA 'AgentBridge-M1'),
     [string]$Python,
     [switch]$CheckRuntime
 )
 $ErrorActionPreference = 'Stop'
+# Site values (Hub URL, certificate fingerprint) come from site.json next to this script when the
+# internal package carries one; explicit parameters win. The public repository ships only site.example.json.
+$bridgeSiteFile = Join-Path $PSScriptRoot 'site.json'
+if (Test-Path -LiteralPath $bridgeSiteFile) {
+    $bridgeSite = Get-Content -LiteralPath $bridgeSiteFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $Hub) { $Hub = $bridgeSite.hub_url }
+    if (-not $Fingerprint) { $Fingerprint = $bridgeSite.hub_fingerprint }
+}
+if (-not $Hub -or -not $Fingerprint) { throw 'Pass -Hub and -Fingerprint, or use an internal package that contains site.json' }
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $bridgeInstall = [IO.Path]::GetFullPath($Install)
 $bridgeState = Join-Path $bridgeInstall 'state'
