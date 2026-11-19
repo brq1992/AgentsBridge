@@ -44,6 +44,8 @@ def in_job(pid=None):
 
 def interpreter():
     """The real interpreter plus its import path (a venv python.exe is a redirector)."""
+    if os.name != 'nt':
+        return sys.executable, list(sys.path)
     return getattr(sys, '_base_executable', None) or sys.executable, list(sys.path)
 
 
@@ -97,9 +99,11 @@ def breakaway_possible(popen=subprocess.Popen):
     return True
 
 
-def agent_start(state, hub_config=None, install=None, health=None, popen=subprocess.Popen, timeout=20,
+def agent_start(state, hub_config=None, install=None, health=None, popen=subprocess.Popen, timeout=None,
                 allow_attached=False):
     """Start the Agent unless one is already healthy for this state directory."""
+    if timeout is None:
+        timeout = 20 if os.name == 'nt' else 60
     from .cli import call
     state = Path(state).resolve()
     install = Path(install or Path(__file__).resolve().parents[1])
@@ -130,6 +134,9 @@ def agent_start(state, hub_config=None, install=None, health=None, popen=subproc
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status = probe()
+        if status and status.get('hub_connected') is False and time.monotonic() < deadline:
+            time.sleep(0.2)
+            continue  # up, but wait for the Hub so callers do not see a half-started node
         if status:
             result = {'action': 'started', 'pid': status['pid'], 'hub_connected': status.get('hub_connected'),
                       'windows_job_member': status.get('windows_job_member'), 'breakaway': breakaway}
@@ -140,4 +147,7 @@ def agent_start(state, hub_config=None, install=None, health=None, popen=subproc
         if process.poll() is not None:
             raise BridgeError('Agent exited during startup; see Agent.stderr.log')
         time.sleep(0.2)
+    if status:
+        return {'action': 'started', 'pid': status['pid'], 'hub_connected': False, 'breakaway': breakaway,
+                'warning': 'Agent is running but not yet connected to the Hub; check doctor in a moment'}
     raise BridgeError('Agent did not answer within the startup timeout; see logs, do not start a second copy')

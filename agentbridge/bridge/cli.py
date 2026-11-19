@@ -66,6 +66,44 @@ def claim(state, body, ack_timeout=ACK_TIMEOUT, receipt_attempts=3):
             'retry': 'run the same ack again; if the receipt was recorded the claim is reported as already received'}
 
 
+QUIET_KEYS = ('id', 'action', 'should_execute', 'kind', 'delivery', 'outcome', 'final', 'reason', 'error',
+              'reply_delivery', 'auto_ack', 'reply_auto_ack')
+
+
+def quiet(result):
+    """Drop payload copies, fingerprints and generations; keep what a caller acts on."""
+    if isinstance(result, dict):
+        return {k: result[k] for k in QUIET_KEYS if k in result and result[k] is not None}
+    if isinstance(result, list):
+        return [quiet(r) for r in result]
+    return result
+
+
+from .policy import NOTICE_TEXT, echo_text  # noqa: E402  (JSON echo only; anything else is a notice)
+
+
+def handle_message(state, body):
+    """ack -> decide -> reply. Executes only what claim() authorised; replies are ack-only."""
+    claimed = claim(state, dict(body))
+    if not claimed.get('should_execute'):
+        reason = str(claimed.get('reason') or '')
+        if claimed.get('kind') in ('reply', 'notice', 'progress') and not reason:
+            action = 'received'                 # ack recorded; nothing to execute
+        elif reason in ('claim_already_received',):
+            action = 'already_received'
+        elif reason.startswith(('hub_unavailable', 'ack_response_lost', 'claim_unconfirmed',
+                                'claim_receipt_unconfirmed')):
+            action = 'ack_failed_retry'         # nothing was claimed; run handle again later
+        else:
+            action = 'not_authorised'           # expired, revoked, rebound, rejected...
+        return dict(claimed, action=action)
+    if claimed.get('kind') != 'request' or not claimed.get('expect_reply', True):
+        return dict(claimed, action='received')
+    text, outcome = echo_text(claimed.get('body'))
+    reply = call(state, '/reply', dict(body, body=text, outcome=outcome, final=True))
+    return dict(reply, action='echoed' if outcome == 'completed' else 'blocked_notice')
+
+
 def main():
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf8')
@@ -73,6 +111,7 @@ def main():
     p.add_argument('--state', required=True)
     p.add_argument('--tool', choices=['claude', 'codex'])
     p.add_argument('--session', help='Explicit bound native UUID; Codex defaults to CODEX_THREAD_ID')
+    p.add_argument('--quiet', action='store_true', help='print only id/delivery/outcome/error')
     sub = p.add_subparsers(dest='command', required=True)
     agent = sub.add_parser('agent')
     agent.add_argument('--hub-config')
@@ -137,6 +176,8 @@ def main():
         group = parser.add_mutually_exclusive_group(required=True)
         group.add_argument('--text')
         group.add_argument('--body-file')
+    handle = sub.add_parser('handle', help='ack, then apply the echo-only policy and reply in one step')
+    handle.add_argument('--message', required=True)
     ack = sub.add_parser('ack')
     ack.add_argument('--message', required=True)
     status = sub.add_parser('status')
@@ -163,10 +204,10 @@ def main():
             return
         tool = args.tool or ('codex' if os.environ.get('CODEX_THREAD_ID') else None)
         native = args.session or (os.environ.get('CODEX_THREAD_ID') if tool == 'codex' else None)
-        if args.command in ('send', 'ack', 'reply', 'bind') and (not tool or not native):
+        if args.command in ('send', 'ack', 'reply', 'bind', 'handle') and (not tool or not native):
             raise BridgeError('native tool/session identity is required')
         context = {'codex_thread_id': os.environ.get('CODEX_THREAD_ID'), 'cli_pid': os.getpid()}
-        if tool == 'codex' and args.command in ('send', 'ack', 'reply') and context['codex_thread_id'] and context['codex_thread_id'] != native:
+        if tool == 'codex' and args.command in ('send', 'ack', 'reply', 'handle') and context['codex_thread_id'] and context['codex_thread_id'] != native:
             raise BridgeError('explicit Codex session differs from calling CODEX_THREAD_ID')
         body = {'actor': f'{tool}:{native}', 'context': context}
         routes = {'doctor': '/health', 'discover': '/discover', 'list': '/sessions', 'unbind': '/unbind',
@@ -188,14 +229,18 @@ def main():
             body['body'] = Path(args.body_file).read_text(encoding='utf-8-sig') if args.body_file else args.text
         if args.command == 'send':
             body.update(to=args.to, message_id=args.id, ttl=args.ttl)
-        if args.command in ('ack', 'reply', 'status'):
+        if args.command in ('ack', 'reply', 'status', 'handle'):
             body['message_id'] = args.message
         if args.command == 'reply':
             body['outcome'] = args.outcome
-        if args.command == 'ack':
+        if args.command == 'handle':
+            result = handle_message(args.state, body)
+        elif args.command == 'ack':
             result = claim(args.state, body)
         else:
             result = call(args.state, routes[args.command], body)
+        if args.quiet:
+            result = quiet(result)
         print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))
     except (BridgeError, OSError, ValueError) as e:
         print(json.dumps({'ok': False, 'error': str(e)}, ensure_ascii=False))

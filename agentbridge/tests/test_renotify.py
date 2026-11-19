@@ -46,7 +46,7 @@ class RenotifyTests(ClaimFixture, unittest.TestCase):
     def test_unclaimed_message_is_renotified_when_idle_with_backoff_and_cap(self):
         self.assertEqual(self.agent.renotify(), ['m_abandoned'])
         self.assertIn('re-notification 1/3', self.sent[0])
-        self.assertIn('ack --message m_abandoned', self.sent[0])
+        self.assertIn('handle --message m_abandoned', self.sent[0])
         self.assertEqual(self.job()['notify_count'], 1)
         self.assertEqual(json.loads(self.job()['last_receipt']), [{'type': 'receipt', 'status': 'held'}])
         self.assertEqual(self.agent.renotify(), [], 'second re-notification waits 180 s')

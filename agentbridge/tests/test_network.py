@@ -226,6 +226,30 @@ class NetworkTests(unittest.TestCase):
             self.assertEqual(b.retry_preflight(sb['id']),[])
             self.assertTrue(self.delivered.empty())
 
+    def test_exact_json_echo_reply_is_auto_acked_and_mismatch_is_injected(self):
+        a,sa=self.agent('win-a')
+        b,sb=self.agent('win-b')
+        a.config['auto_ack_final_echo']=True
+        self.wait_directory(a,2)
+        cases=(('{"op":"echo","text":"中文 ok"}','中文 ok',False),
+               ('{"op":"echo","text":"expected"}','something else',True))
+        for request,answer,injected in cases:
+            m=a.forward('/send',{'actor':sa['id'],'to':'win-b/echo','body':request,'message_id':uid()})
+            self.assertEqual(self.delivered.get(timeout=6)[0]['id'],sb['id'])
+            self.assertTrue(b.forward('/ack',{'actor':sb['id'],'message_id':m['id']})['should_execute'])
+            b.forward('/reply',{'actor':sb['id'],'message_id':m['id'],'body':answer})
+            if injected:
+                self.assertEqual(self.delivered.get(timeout=6)[0]['id'],sa['id'])
+            else:
+                until(lambda:self.hub.status(m['id'])[0]['reply_delivery']=='received')
+                self.assertTrue(self.delivered.empty())
+                reply_id=self.hub.status(m['id'])[0]['final_reply_id']
+                def local():
+                    with a.store.connect() as c:
+                        return c.execute('SELECT auto_ack FROM net_jobs WHERE id=?',(reply_id,)).fetchone()[0]
+                until(lambda:local()!='queued')   # Hub commits before the Agent records the answer
+                self.assertEqual(local(),'agent_received')
+
     def test_automatic_recovery_after_manual_reopen(self):
         a,sa=self.agent('win-a')
         b,sb=self.agent('win-b')

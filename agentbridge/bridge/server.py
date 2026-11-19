@@ -151,7 +151,7 @@ def run(state, hub_config=None):
                         if principal['id'] in (m['sender'], m['receiver'])]
         if path == '/health':
             if remote:
-                result = {'mode': 'windows-m1-network', 'pid': os.getpid(), 'protocol': '1.3',
+                result = {'mode': ('windows' if os.name == 'nt' else 'macos' if sys.platform == 'darwin' else 'posix') + '-m1-network', 'pid': os.getpid(), 'protocol': '1.3',
                           'hub_connected': remote.connected, 'node': remote.label,
                           'recovery_interval_seconds': remote.recovery_interval,
                           'endpoint_health': ({principal['id']: remote.endpoint_health.get(principal['id'], {'state': 'checking'})}
@@ -196,7 +196,7 @@ def run(state, hub_config=None):
                 original = store._session(c, b['identity'])
             if original['tool'] != 'claude':
                 raise BridgeError('only Claude endpoints can be refreshed')
-            metadata = adapters.claude_metadata(original['native_id'])
+            metadata = adapters.claude_metadata(original['native_id'], json.loads(original['metadata']))
             verified = dict(original, metadata=json.dumps(metadata))
             adapters.claude_preflight(verified)  # Exact UUID, live process, qualified version and matching key.
             refreshed = store.refresh_endpoint(original['id'], original['generation'], metadata)

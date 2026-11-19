@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -69,7 +70,7 @@ class RemoteAgent:
                 # who received execution permission: 'legacy', a claim nonce, or 'closed'
                 c.execute('ALTER TABLE net_ops ADD COLUMN consumed_by TEXT')
             job_columns={r['name'] for r in c.execute('PRAGMA table_info(net_jobs)')}
-            for name,ddl in (('notified_at','REAL'),('notify_count','INTEGER NOT NULL DEFAULT 0'),('last_receipt','TEXT'),('renotify_state','TEXT')):
+            for name,ddl in (('notified_at','REAL'),('notify_count','INTEGER NOT NULL DEFAULT 0'),('last_receipt','TEXT'),('renotify_state','TEXT'),('auto_ack','TEXT')):
                 if name not in job_columns:
                     c.execute(f'ALTER TABLE net_jobs ADD COLUMN {name} {ddl}')
             # A re-notification interrupted by a crash may or may not have been written; it was
@@ -82,7 +83,7 @@ class RemoteAgent:
     def status(self):
         with self.store.connect() as c:
             pending=c.execute("SELECT count(*) FROM net_ops WHERE state='pending'").fetchone()[0]
-            jobs=[dict(r) for r in c.execute('SELECT id,state,sequence,error FROM net_jobs')]
+            jobs=[dict(r) for r in c.execute('SELECT id,state,sequence,error,auto_ack FROM net_jobs')]
         return {'node_id':self.node_id,'label':self.label,'connected':self.connected,'last_seen':self.last_seen,
                 'last_error':self.last_error,'pending_operations':pending,'jobs':jobs,
                 'endpoint_health':dict(self.endpoint_health)}
@@ -101,7 +102,7 @@ class RemoteAgent:
                 continue
             try:
                 if session['tool']=='claude':
-                    metadata=adapters.claude_metadata(session['native_id'])
+                    metadata=adapters.claude_metadata(session['native_id'],json.loads(session['metadata']))
                     candidate=dict(session,metadata=json.dumps(metadata))
                     adapters.claude_preflight(candidate)
                     if metadata!=json.loads(session['metadata']):
@@ -117,8 +118,16 @@ class RemoteAgent:
                 # endpoint conditions carry a stable code and a safe hint instead.
                 health[session['id']]={'state':'unavailable','reason':getattr(e,'code',type(e).__name__),
                                        'checked_at':time.time()}
-                if getattr(e,'hint',None):
-                    health[session['id']]['hint']=e.hint
+                try:
+                    if getattr(e,'hint',None):
+                        health[session['id']]['hint']=adapters.fill_hint(e.hint,session['alias'],session['project'])
+                    if health[session['id']]['reason']!=self.endpoint_health.get(session['id'],{}).get('reason'):
+                        # One stderr line per change, so an operator tailing the log sees it at once.
+                        print(json.dumps({'event':'endpoint_unavailable','alias':session['alias'],
+                                          'reason':health[session['id']]['reason'],'hint':health[session['id']].get('hint')},
+                                         ensure_ascii=False),file=sys.stderr,flush=True)
+                except Exception:
+                    pass  # reporting must never abort the pass for the remaining sessions
         self.endpoint_health=health
 
     # Longest a local ack request waits; must stay well below cli.ACK_TIMEOUT.
@@ -383,6 +392,13 @@ class RemoteAgent:
                     if op=='ack':
                         return self._hand_out(c,rid,args,result,nonce)
                     self._close(c,rid)
+                    if op=='status' and isinstance(result,list):
+                        for item in result:
+                            ids=[i for i in (item.get('id'),item.get('final_reply_id')) if i]
+                            local={r['id']:r['auto_ack'] for r in c.execute(
+                                'SELECT id,auto_ack FROM net_jobs WHERE id IN (%s)'%','.join('?'*len(ids)),ids)} if ids else {}
+                            item['auto_ack']=local.get(item.get('id'))
+                            item['reply_auto_ack']=local.get(item.get('final_reply_id'))
                     return result
                 if row['state']=='failed':
                     self._close(c,rid)
@@ -457,6 +473,8 @@ class RemoteAgent:
                             with self.store.connect() as c:
                                 c.execute('UPDATE net_ops SET state=?,result=?,error=? WHERE id=?',
                                     ('done' if response['ok'] else 'failed',json.dumps(response.get('result'),ensure_ascii=False),response.get('error'),operation['id']))
+                                if operation['op']=='ack' and json.loads(operation['args']).get('context',{}).get('auto_ack')=='agent':
+                                    self._resolve_auto_ack(c,operation,response)
                                 if operation['op']=='retry_preflight':
                                     mid=json.loads(operation['args'])['message_id']
                                     c.execute("UPDATE net_jobs SET state=?,error=? WHERE id=? AND state='retry_pending'",
@@ -487,6 +505,68 @@ class RemoteAgent:
         self._enqueue(c,'report',{'message_id':mid,'sequence':sequence,'phase':phase,
                                  'error':str(detail)[:1000] if phase!='submitted' and detail else None,'detail':detail})
 
+    def _resolve_auto_ack(self,c,operation,response):
+        """The Hub answered (or never received) the Agent's own ack of an exact-echo reply.
+
+        The RPC envelope 'ok' only says the Hub processed the call; the business answer is in
+        result. Outcomes recorded in net_jobs.auto_ack (and visible in every status):
+          agent_received          Hub recorded this ack as the receipt (kind=reply, no reason)
+          already_received        someone else (the session itself) acked it first
+          denied:<reason>         Hub refused (expired, binding_revoked, blocked, ...); terminal,
+                                  state 'blocked' or 'expired' -- never reported as received
+          expired_unsent          the reply expired before the ack could be transmitted; terminal
+          failed:<error>          transport/protocol error -> state 'accepted', injected normally
+        """
+        mid=json.loads(operation['args'])['message_id']
+        c.execute("UPDATE net_ops SET handed=1,consumed_by='agent_auto_ack' WHERE id=?",(operation['id'],))
+        result=response.get('result') if isinstance(response.get('result'),dict) else {}
+        reason=str(result.get('reason') or '')
+        if response.get('ok') and result.get('kind')=='reply' and not reason:
+            c.execute("UPDATE net_jobs SET state='received',auto_ack='agent_received' WHERE id=?",(mid,))
+        elif response.get('ok') and reason=='already_received' and result.get('kind')=='reply':
+            c.execute("UPDATE net_jobs SET state='received',auto_ack='already_received' WHERE id=?",(mid,))
+        elif response.get('ok'):
+            terminal='expired' if reason=='expired' else 'blocked'
+            c.execute("UPDATE net_jobs SET state=?,auto_ack=?,error=? WHERE id=?",
+                      (terminal,'denied:'+(reason or 'unknown')[:60],json.dumps({'reason':reason or 'unknown'}),mid))
+        elif response.get('error')=='expired_unsent':
+            c.execute("UPDATE net_jobs SET state='expired',auto_ack='expired_unsent',error=? WHERE id=?",
+                      (json.dumps({'reason':'reply expired before the agent ack was sent'}),mid))
+        else:
+            c.execute("UPDATE net_jobs SET state='accepted',auto_ack=? WHERE id=? AND state!='received'",
+                      ('failed:'+str(response.get('error') or 'unknown')[:60],mid))
+            self.wake.set()
+
+    def expire_auto_acks(self,now=None):
+        """An auto ack whose deadline (= the reply's expiry) passed unsent gets a terminal,
+        queryable state; it is not re-queued (delivery would only block it as expired)."""
+        with self.store.connect() as c:
+            for op in c.execute("""SELECT * FROM net_ops WHERE op='ack' AND state='failed' AND handed=0
+                    AND json_extract(args,'$.context.auto_ack')='agent'""").fetchall():
+                op=dict(op)
+                unsent=(op.get('error') or '').startswith('operation expired before confirmed transmission')
+                self._resolve_auto_ack(c,op,{'ok':False,'error':'expired_unsent' if unsent else op.get('error')})
+
+    def _is_exact_echo_reply(self,c,m):
+        """True only for a completed final reply whose text equals the echo text of the JSON
+        echo request this same binding sent. Anything else (notice, blocked, mismatch, unknown
+        or pruned parent) is injected so the session sees it."""
+        # A reply row's own outcome is 'not_applicable'; a blocked notice reply never equals
+        # the echo text, so body equality alone decides.
+        if not m.get('parent_id'):
+            return False
+        row=c.execute("""SELECT args FROM net_ops WHERE op='send'
+            AND json_extract(args,'$.message_id')=? AND json_extract(args,'$.actor')=?
+            AND json_extract(args,'$.generation')=?
+            ORDER BY seq DESC LIMIT 1""",(m['parent_id'],m['receiver'],m.get('receiver_gen'))).fetchone()
+        if not row:
+            return False
+        from .policy import NOTICE_TEXT, echo_request_text
+        expected=echo_request_text(json.loads(row['args']).get('body'))
+        # A blocked reply carries NOTICE_TEXT; if the echo text is that same string the body
+        # cannot tell them apart, so stay conservative and let the session see it.
+        return expected is not None and expected!=NOTICE_TEXT and m.get('body')==expected
+
     def delivery_loop(self):
         while not self.stop.is_set():
             if time.monotonic()>=self._recovery_at:
@@ -498,6 +578,10 @@ class RemoteAgent:
                 self._recovery_at=time.monotonic()+self.recovery_interval
                 try:
                     self.renotify()
+                except Exception:
+                    pass
+                try:
+                    self.expire_auto_acks()
                 except Exception:
                     pass
                 if time.monotonic()>=self._pruned_at:
@@ -525,16 +609,35 @@ class RemoteAgent:
                     self._phase(c,m['id'],'blocked',{'reason':'binding changed or expired before submission'})
                     self.wake.set()
                     continue
-                # Preflight against the endpoint as stored in this same transaction, so a
-                # concurrent endpoint refresh cannot leave a stale pipe/CLI in 'prepared'.
-                try:
-                    session=dict(current_session)
-                    prepared=adapters.prepare(session,adapters.envelope(m,session,client_state))
-                except Exception as e:
-                    self._phase(c,m['id'],'blocked',{'reason':str(e)[:1000]})
-                    self.wake.set()
-                    continue
-                self._phase(c,m['id'],'submitting')
+                auto_reply=(self.config.get('auto_ack_final_echo') is True
+                            and not self.config.get('inject_final_replies', False)
+                            and m.get('kind')=='reply' and m.get('final')
+                            and row['auto_ack'] is None
+                            and self._is_exact_echo_reply(c,m))
+                if auto_reply:
+                    # Opt-in (auto_ack_final_echo): an exact echo reply is acked by the Agent and
+                    # not written into the session. The ack is queued in this same transaction,
+                    # so a disconnect, crash or restart only delays it; status reports
+                    # agent_received, never session_received.
+                    self._phase(c,m['id'],'submitted',{'transport':'agent','meaning':'agent_received_not_injected'})
+                    self._enqueue(c,'ack',{'message_id':m['id'],'actor':m['receiver'],
+                                           'generation':current_session['generation'],
+                                           'context':{'auto_ack':'agent'}},m['expires'])
+                    c.execute("UPDATE net_jobs SET auto_ack='queued' WHERE id=?",(m['id'],))
+                else:
+                    # Preflight against the endpoint as stored in this same transaction, so a
+                    # concurrent endpoint refresh cannot leave a stale pipe/CLI in 'prepared'.
+                    try:
+                        session=dict(current_session)
+                        prepared=adapters.prepare(session,adapters.envelope(m,session,client_state))
+                    except Exception as e:
+                        self._phase(c,m['id'],'blocked',{'reason':str(e)[:1000]})
+                        self.wake.set()
+                        continue
+                    self._phase(c,m['id'],'submitting')
+            if auto_reply:
+                self.wake.set()
+                continue
             try:
                 detail=adapters.deliver(prepared)
                 phase='submitted'
